@@ -96,6 +96,22 @@ final class StemMixerEngine {
         applyMixToAllTracks()
     }
 
+    /// Oslobodi sve stemove i vrati engine u prazno stanje (UI → izbor pesme).
+    func unload() {
+        stop()
+        engine.stop()
+        for (_, track) in tracks {
+            if track.player.engine != nil { engine.detach(track.player) }
+        }
+        for kind in StemKind.allCases { tracks[kind]?.file = nil }
+        stems.removeAll()
+        duration = 0
+        totalFrames = 0
+        seekFrame = 0
+        currentTime = 0
+        isLoaded = false
+    }
+
     // MARK: - Transport
 
     func play() {

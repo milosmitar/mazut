@@ -11,8 +11,11 @@ struct ContentView: View {
     @State private var separator = DemucsSeparator()
     @State private var stems: [Stem] = StemKind.allCases.map { Stem(kind: $0) }
     @State private var showImporter = false
-    @State private var showSongImporter = false
+    /// true = „Razdvoj pesmu" (jedan fajl → separacija), false = „Učitaj gotove stemove" (više fajlova).
+    @State private var importSongMode = false
     @State private var loadError: String?
+    @State private var separationTask: Task<Void, Never>?
+    @State private var library: [CachedSong] = []
 
     var body: some View {
         NavigationStack {
@@ -21,36 +24,50 @@ struct ContentView: View {
                     transportBar
                     Divider()
                     stemList
-                } else {
+                } else if library.isEmpty {
                     emptyState
+                } else {
+                    libraryView
                 }
             }
             .navigationTitle("Mazut")
+            .onAppear { library = StemCache.library() }
             .toolbar {
+                if engine.isLoaded {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            engine.unload()
+                            stems = StemKind.allCases.map { Stem(kind: $0) }
+                            library = StemCache.library()
+                        } label: {
+                            Label("Nova pesma", systemImage: "chevron.left")
+                        }
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
+                        importSongMode = false
                         showImporter = true
                     } label: {
                         Image(systemName: "square.and.arrow.down")
                     }
                 }
             }
+            // Jedan jedini .fileImporter: dva na istom view-u se u SwiftUI-ju
+            // poništavaju (radi samo poslednji). Režim biramo preko importSongMode.
             .fileImporter(
                 isPresented: $showImporter,
                 allowedContentTypes: [.audio],
-                allowsMultipleSelection: true
+                allowsMultipleSelection: !importSongMode
             ) { result in
-                handleImport(result)
-            }
-            .fileImporter(
-                isPresented: $showSongImporter,
-                allowedContentTypes: [.audio],
-                allowsMultipleSelection: false
-            ) { result in
-                if case .success(let urls) = result, let url = urls.first {
-                    separateSong(url)
-                } else if case .failure(let error) = result {
-                    loadError = error.localizedDescription
+                if importSongMode {
+                    if case .success(let urls) = result, let url = urls.first {
+                        separateSong(url)
+                    } else if case .failure(let error) = result {
+                        loadError = error.localizedDescription
+                    }
+                } else {
+                    handleImport(result)
                 }
             }
             .alert("Greška", isPresented: .constant(loadError != nil)) {
@@ -72,6 +89,17 @@ struct ContentView: View {
                 Text("Razdvajam stemove… \(Int(separator.progress * 100))%")
                     .font(.headline)
                     .foregroundStyle(.white)
+
+                Button(role: .cancel) {
+                    separationTask?.cancel()
+                } label: {
+                    Text("Odustani")
+                        .font(.subheadline.bold())
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.bordered)
+                .tint(.white)
             }
             .padding(28)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
@@ -94,7 +122,8 @@ struct ContentView: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 40)
             Button {
-                showSongImporter = true
+                importSongMode = true
+                showImporter = true
             } label: {
                 Label("Razdvoj pesmu", systemImage: "wand.and.stars")
                     .font(.headline)
@@ -103,12 +132,85 @@ struct ContentView: View {
             .padding(.top, 8)
 
             Button {
+                importSongMode = false
                 showImporter = true
             } label: {
                 Label("Učitaj gotove stemove", systemImage: "folder")
                     .font(.subheadline)
             }
             Spacer()
+        }
+    }
+
+    // MARK: - Biblioteka keširanih pesama
+
+    private var libraryView: some View {
+        VStack(spacing: 0) {
+            List {
+                Section("Ranije razdvojeno") {
+                    ForEach(library) { song in
+                        Button {
+                            openCached(song)
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: "music.note")
+                                    .foregroundStyle(.secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(song.name)
+                                        .font(.body)
+                                        .foregroundStyle(.primary)
+                                    Text(song.date, style: .date)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
+                        }
+                    }
+                    .onDelete { offsets in
+                        for i in offsets { StemCache.delete(key: library[i].id) }
+                        library = StemCache.library()
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+
+            Menu {
+                Button {
+                    importSongMode = true
+                    showImporter = true
+                } label: {
+                    Label("Razdvoj pesmu", systemImage: "wand.and.stars")
+                }
+                Button {
+                    importSongMode = false
+                    showImporter = true
+                } label: {
+                    Label("Učitaj gotove stemove", systemImage: "folder")
+                }
+            } label: {
+                Label("Dodaj novu", systemImage: "plus")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+            }
+            .buttonStyle(.borderedProminent)
+            .padding()
+        }
+    }
+
+    /// Učitaj keširanu pesmu u mikser bez ponovnog razdvajanja.
+    private func openCached(_ song: CachedSong) {
+        let assigned = StemKind.allCases.map { Stem(kind: $0) }
+        for stem in assigned { stem.url = song.stems[stem.kind] }
+        stems = assigned
+        do {
+            try engine.load(stems: stems)
+        } catch {
+            loadError = error.localizedDescription
         }
     }
 
@@ -159,7 +261,7 @@ struct ContentView: View {
         switch result {
         case .success(let urls):
             // Kopiraj fajlove lokalno (izbegava security-scope probleme) i dodeli redom.
-            var assigned: [Stem] = StemKind.allCases.map { Stem(kind: $0) }
+            let assigned: [Stem] = StemKind.allCases.map { Stem(kind: $0) }
             for (index, url) in urls.prefix(StemKind.allCases.count).enumerated() {
                 guard let local = copyToTemp(url) else { continue }
                 assigned[index].url = local
@@ -177,16 +279,20 @@ struct ContentView: View {
 
     private func separateSong(_ url: URL) {
         guard let local = copyToTemp(url) else { loadError = "Ne mogu da učitam fajl."; return }
-        Task {
+        separationTask = Task {
             do {
                 let map = try await separator.separate(url: local)
                 let assigned = StemKind.allCases.map { Stem(kind: $0) }
                 for stem in assigned { stem.url = map[stem.kind] }
                 stems = assigned
                 try engine.load(stems: stems)
+                library = StemCache.library()   // nova pesma je sad u kešu
+            } catch is CancellationError {
+                // Korisnik je odustao — bez greške, samo se vrati na izbor pesme.
             } catch {
                 loadError = error.localizedDescription
             }
+            separationTask = nil
         }
     }
 

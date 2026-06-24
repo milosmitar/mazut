@@ -30,6 +30,10 @@ final class DemucsSeparator {
 
     /// Razdvoji pesmu i vrati URL-ove 6 stem .wav fajlova (po StemKind).
     func separate(url: URL) async throws -> [StemKind: URL] {
+        // Keš pogodak: pesma je već razdvojena → vrati postojeće stemove odmah.
+        let key = try StemCache.key(for: url)
+        if let cached = StemCache.stems(for: key) { return cached }
+
         await MainActor.run { self.isRunning = true; self.progress = 0 }
         defer { Task { @MainActor in self.isRunning = false } }
 
@@ -48,6 +52,7 @@ final class DemucsSeparator {
         var chunkIdx = 0
         var pos = 0
         while pos < total {
+            try Task.checkCancellation()   // dozvoli „Odustani" između segmenata
             let len = min(TL, total - pos)
             var chunk = [[Float]](repeating: [Float](repeating: 0, count: TL), count: 2)
             for c in 0..<2 {
@@ -86,16 +91,16 @@ final class DemucsSeparator {
             for s in 0..<6 { for c in 0..<2 { out[s][c][i] /= wsum[i] } }
         }
 
-        // Upis 6 .wav fajlova.
+        // Upis 6 .wav fajlova u trajni keš (folder = hash sadržaja pesme).
         var result: [StemKind: URL] = [:]
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("separated", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dir = StemCache.directory(for: key)
         for s in 0..<6 {
             let kind = Self.modelOrder[s]
             let fileURL = dir.appendingPathComponent("\(kind.rawValue).wav")
             try writeWav(channels: out[s], to: fileURL)
             result[kind] = fileURL
         }
+        StemCache.saveMeta(key: key, name: url.deletingPathExtension().lastPathComponent)
         await MainActor.run { self.progress = 1 }
         return result
     }
