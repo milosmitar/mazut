@@ -21,3 +21,9 @@ DerivedData/
 *.xcuserstate
 xcuserdata/
 *.xcscmblueprint
+
+# Izuzetak: app-bundlovani Core ML model držimo u repou (preko Git LFS)
+# da bi app mogao da se build-uje bez ručne regeneracije.
+# Mora doći POSLE *.mlpackage/ i *.bin pravila (poslednje poklapanje pobeđuje).
+!Mazut/HTDemucs6sCore.mlpackage/
+!Mazut/HTDemucs6sCore.mlpackage/**
