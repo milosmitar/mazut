@@ -20,6 +20,8 @@ struct ContentView: View {
     @State private var loadError: String?
     @State private var separationTask: Task<Void, Never>?
     @State private var library: [CachedSong] = []
+    /// Ime pesme koja je trenutno učitana (prikazuje se u headeru umesto „Mazut").
+    @State private var nowPlayingTitle: String?
 
     var body: some View {
         NavigationStack {
@@ -34,7 +36,8 @@ struct ContentView: View {
                     libraryView
                 }
             }
-            .navigationTitle("Mazut")
+            .navigationTitle(engine.isLoaded ? (nowPlayingTitle ?? "Mazut") : "Mazut")
+            .navigationBarTitleDisplayMode(engine.isLoaded ? .inline : .large)
             .onAppear { library = StemCache.library() }
             .toolbar {
                 if engine.isLoaded {
@@ -42,6 +45,7 @@ struct ContentView: View {
                         Button {
                             engine.unload()
                             stems = StemKind.allCases.map { Stem(kind: $0) }
+                            nowPlayingTitle = nil
                             library = StemCache.library()
                         } label: {
                             Label("Nova pesma", systemImage: "chevron.left")
@@ -231,6 +235,7 @@ struct ContentView: View {
         stems = assigned
         do {
             try engine.load(stems: stems)
+            nowPlayingTitle = song.name
         } catch {
             loadError = error.localizedDescription
         }
@@ -291,6 +296,7 @@ struct ContentView: View {
             stems = assigned
             do {
                 try engine.load(stems: stems)
+                nowPlayingTitle = nil   // skup zasebnih stemova → ostaje „Mazut"
             } catch {
                 loadError = error.localizedDescription
             }
@@ -308,6 +314,7 @@ struct ContentView: View {
                 for stem in assigned { stem.url = map[stem.kind] }
                 stems = assigned
                 try engine.load(stems: stems)
+                nowPlayingTitle = local.deletingPathExtension().lastPathComponent
                 library = StemCache.library()   // nova pesma je sad u kešu
             } catch is CancellationError {
                 // Korisnik je odustao — bez greške, samo se vrati na izbor pesme.

@@ -96,8 +96,8 @@ final class DemucsSeparator {
         let dir = StemCache.directory(for: key)
         for s in 0..<6 {
             let kind = Self.modelOrder[s]
-            let fileURL = dir.appendingPathComponent("\(kind.rawValue).wav")
-            try writeWav(channels: out[s], to: fileURL)
+            let fileURL = dir.appendingPathComponent("\(kind.rawValue).\(StemCache.stemExtension)")
+            try writeStem(channels: out[s], to: fileURL)
             result[kind] = fileURL
         }
         StemCache.saveMeta(key: key, name: url.deletingPathExtension().lastPathComponent)
@@ -179,18 +179,22 @@ final class DemucsSeparator {
         return [left, right]
     }
 
-    private func writeWav(channels: [[Float]], to url: URL) throws {
+    /// Bitrate AAC enkodera po stemu (stereo). 192 kbps ≈ transparentno,
+    /// a ~7× manje od 16-bit PCM .wav (1411 kbps).
+    private static let aacBitRate = 192_000
+
+    private func writeStem(channels: [[Float]], to url: URL) throws {
         let n = channels[0].count
         let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                 sampleRate: Double(DemucsParams.sampleRate),
                                 channels: 2, interleaved: false)!
+        // AAC u .m4a kontejneru. Float buffer (= processingFormat) se interno
+        // enkoduje u AAC pri upisu.
         let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: Double(DemucsParams.sampleRate),
             AVNumberOfChannelsKey: 2,
-            AVLinearPCMBitDepthKey: 16,
-            AVLinearPCMIsFloatKey: false,
-            AVLinearPCMIsBigEndianKey: false,
+            AVEncoderBitRateKey: Self.aacBitRate,
         ]
         try? FileManager.default.removeItem(at: url)
         let outFile = try AVAudioFile(forWriting: url, settings: settings)

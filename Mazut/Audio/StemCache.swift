@@ -22,6 +22,9 @@ struct CachedSong: Identifiable {
 
 enum StemCache {
 
+    /// Format keširanih stemova (AAC u .m4a kontejneru — ~6× manje od PCM .wav).
+    static let stemExtension = "m4a"
+
     /// Koren keša: <Application Support>/MazutStems/
     private static var root: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -45,14 +48,22 @@ enum StemCache {
         return dir
     }
 
-    /// Mapa stemova ako su svih 6 .wav prisutni, inače nil (keš-miss).
+    /// Mapa stemova ako su svih 6 fajlova prisutni, inače nil (keš-miss).
+    /// Traži .m4a, pa pada na .wav (zbog starijeg keša).
     static func stems(for key: String) -> [StemKind: URL]? {
+        let fm = FileManager.default
         let dir = root.appendingPathComponent(key, isDirectory: true)
         var map: [StemKind: URL] = [:]
         for kind in StemKind.allCases {
-            let u = dir.appendingPathComponent("\(kind.rawValue).wav")
-            guard FileManager.default.fileExists(atPath: u.path) else { return nil }
-            map[kind] = u
+            let m4a = dir.appendingPathComponent("\(kind.rawValue).\(stemExtension)")
+            let wav = dir.appendingPathComponent("\(kind.rawValue).wav")
+            if fm.fileExists(atPath: m4a.path) {
+                map[kind] = m4a
+            } else if fm.fileExists(atPath: wav.path) {
+                map[kind] = wav
+            } else {
+                return nil
+            }
         }
         return map
     }
