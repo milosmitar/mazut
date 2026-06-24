@@ -13,7 +13,7 @@ import CoreML
 import Accelerate
 
 @Observable
-final class DemucsSeparator {
+nonisolated final class DemucsSeparator {
 
     enum SeparationError: Error { case modelMissing, audioLoad, modelOutput }
 
@@ -24,7 +24,7 @@ final class DemucsSeparator {
     private(set) var isRunning = false
 
     private let dsp = DemucsDSP()
-    private let overlap = 0.25
+    private let overlap = 0.1   // 0.25 → 0.1: ~13% manje segmenata, zanemarljiv artefakt na granicama
 
     // MARK: - Javni API
 
@@ -32,7 +32,10 @@ final class DemucsSeparator {
     func separate(url: URL) async throws -> [StemKind: URL] {
         // Keš pogodak: pesma je već razdvojena → vrati postojeće stemove odmah.
         let key = try StemCache.key(for: url)
-        if let cached = StemCache.stems(for: key) { return cached }
+        if let cached = StemCache.stems(for: key) {
+            print("[Mazut] keš pogodak — preskačem razdvajanje (obriši iz biblioteke da bi ponovo merio)")
+            return cached
+        }
 
         await MainActor.run { self.isRunning = true; self.progress = 0 }
         defer { Task { @MainActor in self.isRunning = false } }
@@ -48,43 +51,54 @@ final class DemucsSeparator {
         var wsum = [Float](repeating: 0, count: total)
         let win = olaWindow(TL)
 
-        let nChunks = max(1, Int(ceil(Double(max(0, total - 1)) / Double(stride))) + 1)
-        var chunkIdx = 0
-        var pos = 0
-        while pos < total {
-            try Task.checkCancellation()   // dozvoli „Odustani" između segmenata
-            let len = min(TL, total - pos)
-            var chunk = [[Float]](repeating: [Float](repeating: 0, count: TL), count: 2)
-            for c in 0..<2 {
-                for i in 0..<len { chunk[c][i] = mix[c][pos + i] }
-            }
+        // Pozicije svih segmenata.
+        var positions: [Int] = []
+        var p = 0
+        while p < total { positions.append(p); p += stride }
+        let nChunks = positions.count
 
-            let (spec, time) = try predict(model: model, mix: chunk)
-            // VAŽNO: Core ML izlazi imaju padding (strides != kontinualno) —
-            // npr. time_out kanal stride je 343984, ne 343980. Čitamo preko strides.
-            let specP = spec.dataPointer.bindMemory(to: Float.self, capacity: spec.strides[0].intValue)
-            let timeP = time.dataPointer.bindMemory(to: Float.self, capacity: time.strides[0].intValue)
-            let specStemStride = spec.strides[1].intValue
-            let specChStride = spec.strides[2].intValue   // jedan cac kanal (F*T, kontinualno)
-            let timeStemStride = time.strides[1].intValue
-            let timeChStride = time.strides[2].intValue
-            for s in 0..<6 {
-                for c in 0..<2 {
-                    let reOff = s * specStemStride + (2 * c) * specChStride
-                    let imOff = s * specStemStride + (2 * c + 1) * specChStride
-                    let wav = dsp.istftChannel(re: specP + reOff, im: specP + imOff)
-                    let tOff = s * timeStemStride + c * timeChStride
-                    for i in 0..<len {
-                        out[s][c][pos + i] += (wav[i] + timeP[tOff + i]) * win[i]
-                    }
+        let tWall0 = CFAbsoluteTimeGetCurrent()
+
+        // --- Pipeline: dok GPU radi inferenciju segmenta i, CPU paralelno radi
+        // ISTFT segmenta i-1 i STFT segmenta i+1 (A1+A2). Drži najviše 2 izlaza u RAM-u. ---
+        if nChunks > 0 {
+            var pending: (spec: MLMultiArray, time: MLMultiArray, pos: Int, len: Int)?
+            var nextInput = try makeInput(model: model, mix: mix, pos: positions[0], total: total, TL: TL)
+
+            for i in 0..<nChunks {
+                try Task.checkCancellation()   // „Odustani" između segmenata
+                let curProvider = nextInput.provider
+                let curPos = positions[i]
+                let curLen = nextInput.len
+
+                // GPU: inferencija tekućeg segmenta (paralelno sa CPU radom ispod).
+                async let inferred = runInference(model, curProvider)
+
+                // CPU (preklopljeno sa inferencijom): potroši prethodni + pripremi sledeći.
+                if let pend = pending {
+                    consume(spec: pend.spec, time: pend.time, pos: pend.pos, len: pend.len,
+                            out: &out, wsum: &wsum, win: win)
+                    pending = nil
                 }
-            }
-            for i in 0..<len { wsum[pos + i] += win[i] }
+                if i + 1 < nChunks {
+                    nextInput = try makeInput(model: model, mix: mix, pos: positions[i + 1], total: total, TL: TL)
+                }
 
-            chunkIdx += 1
-            await MainActor.run { self.progress = min(1, Double(chunkIdx) / Double(nChunks)) }
-            pos += stride
+                let (spec, time) = try await inferred
+                pending = (spec, time, curPos, curLen)
+                await MainActor.run { self.progress = min(1, Double(i + 1) / Double(nChunks)) }
+            }
+            // Poslednji segment.
+            if let pend = pending {
+                consume(spec: pend.spec, time: pend.time, pos: pend.pos, len: pend.len,
+                        out: &out, wsum: &wsum, win: win)
+            }
         }
+
+        let wall = CFAbsoluteTimeGetCurrent() - tWall0
+        let audioSec = Double(total) / Double(DemucsParams.sampleRate)
+        print(String(format: "[Mazut] %d seg | zvuk %.0fs → obrada %.1fs (%.2f× realtime)",
+                     nChunks, audioSec, wall, audioSec / max(wall, 0.001)))
 
         // Normalizacija overlap-add.
         for i in 0..<total where wsum[i] > 1e-6 {
@@ -116,27 +130,70 @@ final class DemucsSeparator {
         return try MLModel(contentsOf: url, configuration: cfg)
     }
 
-    /// Pokreni model za jedan segment. Vraća (spec_out, time_out) MLMultiArray-eve
-    /// (čitaju se preko strides u pozivaocu zbog padding-a).
-    private func predict(model: MLModel, mix: [[Float]]) throws -> (MLMultiArray, MLMultiArray) {
-        let TL = DemucsParams.segmentSamples
-        let magFlat = dsp.magnitude(mix: mix)                    // [4*2048*336]
+    /// Pripremi ulaz za jedan segment: STFT (mag) + mix → MLFeatureProvider.
+    /// Vraća i stvarnu dužinu segmenta (poslednji može biti kraći).
+    private func makeInput(model: MLModel, mix: [[Float]], pos: Int, total: Int, TL: Int)
+        throws -> (provider: MLFeatureProvider, len: Int) {
+        let len = min(TL, total - pos)
+        var chunk = [[Float]](repeating: [Float](repeating: 0, count: TL), count: 2)
+        for c in 0..<2 { for i in 0..<len { chunk[c][i] = mix[c][pos + i] } }
 
+        let magFlat = dsp.magnitude(mix: chunk)            // STFT + cac magnituda
         let magArr = try MLMultiArray(shape: [1, 4, 2048, 336], dataType: .float32)
         magFlat.withUnsafeBufferPointer { src in
             _ = memcpy(magArr.dataPointer, src.baseAddress!, magFlat.count * MemoryLayout<Float>.size)
         }
         let mixArr = try MLMultiArray(shape: [1, 2, NSNumber(value: TL)], dataType: .float32)
         let mixPtr = mixArr.dataPointer.bindMemory(to: Float.self, capacity: 2 * TL)
-        for c in 0..<2 { for i in 0..<TL { mixPtr[c * TL + i] = mix[c][i] } }
+        for c in 0..<2 { for i in 0..<TL { mixPtr[c * TL + i] = chunk[c][i] } }
 
-        let input = try MLDictionaryFeatureProvider(dictionary: ["mag": magArr, "mix": mixArr])
-        let result = try model.prediction(from: input)
+        let provider = try MLDictionaryFeatureProvider(dictionary: ["mag": magArr, "mix": mixArr])
+        return (provider, len)
+    }
+
+    /// Core ML inferencija (kao zaseban async task → preklapa se sa CPU radom).
+    private func runInference(_ model: MLModel, _ provider: MLFeatureProvider)
+        async throws -> (MLMultiArray, MLMultiArray) {
+        let result = try await model.prediction(from: provider)
         guard let spec = result.featureValue(for: "spec_out")?.multiArrayValue,
               let time = result.featureValue(for: "time_out")?.multiArrayValue else {
             throw SeparationError.modelOutput
         }
         return (spec, time)
+    }
+
+    /// ISTFT (12 paralelnih: 6 stemova × 2 kanala) + overlap-add u izlazni bafer.
+    private func consume(spec: MLMultiArray, time: MLMultiArray, pos: Int, len: Int,
+                         out: inout [[[Float]]], wsum: inout [Float], win: [Float]) {
+        // Core ML izlazi imaju padding (strides != kontinualno) — čitamo preko strides.
+        let specP = spec.dataPointer.bindMemory(to: Float.self, capacity: spec.strides[0].intValue)
+        let timeP = time.dataPointer.bindMemory(to: Float.self, capacity: time.strides[0].intValue)
+        let specStemStride = spec.strides[1].intValue
+        let specChStride = spec.strides[2].intValue   // jedan cac kanal (F*T, kontinualno)
+        let timeStemStride = time.strides[1].intValue
+        let timeChStride = time.strides[2].intValue
+
+        // Paralelni ISTFT: 12 nezavisnih (stem,kanal) → svaki piše u svoj slot.
+        var waves = [[Float]](repeating: [], count: 12)
+        waves.withUnsafeMutableBufferPointer { wbuf in
+            DispatchQueue.concurrentPerform(iterations: 12) { j in
+                let s = j / 2, c = j % 2
+                let reOff = s * specStemStride + (2 * c) * specChStride
+                let imOff = s * specStemStride + (2 * c + 1) * specChStride
+                wbuf[j] = dsp.istftChannel(re: specP + reOff, im: specP + imOff)
+            }
+        }
+
+        // Sekvencijalni overlap-add (deli zajednički `out`/`wsum`).
+        for j in 0..<12 {
+            let s = j / 2, c = j % 2
+            let wav = waves[j]
+            let tOff = s * timeStemStride + c * timeChStride
+            for i in 0..<len {
+                out[s][c][pos + i] += (wav[i] + timeP[tOff + i]) * win[i]
+            }
+        }
+        for i in 0..<len { wsum[pos + i] += win[i] }
     }
 
     // MARK: - Audio I/O

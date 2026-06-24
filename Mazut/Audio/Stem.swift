@@ -8,7 +8,7 @@
 import SwiftUI
 
 /// Tip stema. Redosled prati standardni izlaz Spleeter / Demucs modela (4 stema).
-enum StemKind: String, CaseIterable, Identifiable {
+nonisolated enum StemKind: String, CaseIterable, Identifiable {
     case vocals
     case drums
     case bass

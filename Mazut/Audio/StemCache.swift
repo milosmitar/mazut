@@ -12,7 +12,7 @@ import Foundation
 import CryptoKit
 
 /// Jedna keširana pesma za prikaz u biblioteci.
-struct CachedSong: Identifiable {
+nonisolated struct CachedSong: Identifiable {
     let id: String              // ključ = hash sadržaja
     let name: String            // originalno ime fajla (za prikaz)
     let date: Date              // kada je razdvojena
@@ -20,7 +20,7 @@ struct CachedSong: Identifiable {
     let size: Int64             // zauzeće na disku (bajtovi)
 }
 
-enum StemCache {
+nonisolated enum StemCache {
 
     /// Format keširanih stemova (AAC u .m4a kontejneru — ~6× manje od PCM .wav).
     static let stemExtension = "m4a"

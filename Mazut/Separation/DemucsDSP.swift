@@ -11,7 +11,7 @@ import Foundation
 import Accelerate
 
 /// Fiksni parametri modela htdemucs_6s (segment 7.8 s @ 44100).
-enum DemucsParams {
+nonisolated enum DemucsParams {
     static let nFFT = 4096
     static let hop = 1024
     static let log2n = vDSP_Length(12)
@@ -34,7 +34,9 @@ enum DemucsParams {
 private extension Double { var squareRootValue: Double { Foundation.sqrt(self) } }
 
 /// vDSP-bazirani STFT/ISTFT. Drži FFT setup i hann prozor (kreirati jednom).
-final class DemucsDSP {
+/// `nonisolated` — čiste funkcije (samo read-only `setup`/`hann`), bezbedne za
+/// poziv iz pozadinskih niti (concurrentPerform / pipeline).
+nonisolated final class DemucsDSP: @unchecked Sendable {
     private let setup: FFTSetup
     private let hann: [Float]
     private let P = DemucsParams.self
