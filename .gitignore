@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Python venv / cache
+conversion/.venv/
+**/__pycache__/
+*.pyc
+
+# Core ML modeli (veliki binarni — regenerišu se convert skriptama)
+*.mlpackage/
+
+# Generisani fixtures i audio iz slušnih testova
+conversion/fixtures/
+conversion/listen_test/
+*.wav
+*.bin
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
