@@ -7,6 +7,10 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
+    @Environment(\.openURL) private var openURL
+    /// Eksterni izvor pesama (otvara se u pregledaču).
+    private let downloadURL = URL(string: "https://st-tancpol.ru/music")!
+
     @State private var engine = StemMixerEngine()
     @State private var separator = DemucsSeparator()
     @State private var stems: [Stem] = StemKind.allCases.map { Stem(kind: $0) }
@@ -42,14 +46,6 @@ struct ContentView: View {
                         } label: {
                             Label("Nova pesma", systemImage: "chevron.left")
                         }
-                    }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        importSongMode = false
-                        showImporter = true
-                    } label: {
-                        Image(systemName: "square.and.arrow.down")
                     }
                 }
             }
@@ -138,6 +134,13 @@ struct ContentView: View {
                 Label("Učitaj gotove stemove", systemImage: "folder")
                     .font(.subheadline)
             }
+
+            Button {
+                openURL(downloadURL)
+            } label: {
+                Label("Preuzmi pesme", systemImage: "globe")
+                    .font(.subheadline)
+            }
             Spacer()
         }
     }
@@ -147,7 +150,7 @@ struct ContentView: View {
     private var libraryView: some View {
         VStack(spacing: 0) {
             List {
-                Section("Ranije razdvojeno") {
+                Section {
                     ForEach(library) { song in
                         Button {
                             openCached(song)
@@ -159,7 +162,7 @@ struct ContentView: View {
                                     Text(song.name)
                                         .font(.body)
                                         .foregroundStyle(.primary)
-                                    Text(song.date, style: .date)
+                                    Text("\(song.date.formatted(date: .abbreviated, time: .omitted)) · \(song.size.formatted(.byteCount(style: .file)))")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
@@ -174,6 +177,11 @@ struct ContentView: View {
                         for i in offsets { StemCache.delete(key: library[i].id) }
                         library = StemCache.library()
                     }
+                } header: {
+                    Text("Ranije razdvojeno")
+                } footer: {
+                    let total = library.reduce(Int64(0)) { $0 + $1.size }
+                    Text("\(library.count) \(pesmaPlural(library.count)) · ukupno \(total.formatted(.byteCount(style: .file)))")
                 }
             }
             .listStyle(.insetGrouped)
@@ -191,6 +199,11 @@ struct ContentView: View {
                 } label: {
                     Label("Učitaj gotove stemove", systemImage: "folder")
                 }
+                Button {
+                    openURL(downloadURL)
+                } label: {
+                    Label("Preuzmi pesme", systemImage: "globe")
+                }
             } label: {
                 Label("Dodaj novu", systemImage: "plus")
                     .font(.headline)
@@ -200,6 +213,15 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .padding()
         }
+    }
+
+    /// Srpska množina za „pesma": 1 → pesma, 2–4 → pesme, ostalo → pesama
+    /// (izuzeci 11–14 → pesama).
+    private func pesmaPlural(_ n: Int) -> String {
+        let d = n % 10, dd = n % 100
+        if d == 1 && dd != 11 { return "pesma" }
+        if (2...4).contains(d) && !(12...14).contains(dd) { return "pesme" }
+        return "pesama"
     }
 
     /// Učitaj keširanu pesmu u mikser bez ponovnog razdvajanja.

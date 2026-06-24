@@ -17,6 +17,7 @@ struct CachedSong: Identifiable {
     let name: String            // originalno ime fajla (za prikaz)
     let date: Date              // kada je razdvojena
     let stems: [StemKind: URL]  // putanje 6 stem .wav fajlova
+    let size: Int64             // zauzeće na disku (bajtovi)
 }
 
 enum StemCache {
@@ -87,13 +88,32 @@ enum StemCache {
                 name = json["name"] ?? name
                 if let d = json["date"], let parsed = iso.date(from: d) { date = parsed }
             }
-            songs.append(CachedSong(id: key, name: name, date: date, stems: stems))
+            songs.append(CachedSong(id: key, name: name, date: date,
+                                    stems: stems, size: folderSize(dir)))
         }
         return songs.sorted { $0.date > $1.date }
+    }
+
+    /// Ukupno zauzeće keša na disku (bajtovi).
+    static func totalSize() -> Int64 {
+        folderSize(root)
     }
 
     /// Obriši keširanu pesmu.
     static func delete(key: String) {
         try? FileManager.default.removeItem(at: root.appendingPathComponent(key, isDirectory: true))
+    }
+
+    /// Zbir veličina svih fajlova u (pod)folderu.
+    private static func folderSize(_ dir: URL) -> Int64 {
+        guard let en = FileManager.default.enumerator(
+            at: dir, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+        var total: Int64 = 0
+        for case let url as URL in en {
+            if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize {
+                total += Int64(size)
+            }
+        }
+        return total
     }
 }
