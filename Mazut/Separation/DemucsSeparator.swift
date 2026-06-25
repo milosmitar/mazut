@@ -11,11 +11,16 @@ import Foundation
 import AVFoundation
 import CoreML
 import Accelerate
+import os
 
 @Observable
 nonisolated final class DemucsSeparator {
 
     enum SeparationError: Error { case modelMissing, audioLoad, modelOutput }
+
+    /// Unified logging — vidljivo i u Xcode konzoli i u Console.app/stream-u
+    /// (za razliku od `print`, koji ide samo na stdout pod debuggerom).
+    private static let log = Logger(subsystem: "com.tarmi.Mazut", category: "separacija")
 
     /// Redosled izlaza modela (sources) → StemKind.
     static let modelOrder: [StemKind] = [.drums, .bass, .other, .vocals, .guitar, .piano]
@@ -30,10 +35,11 @@ nonisolated final class DemucsSeparator {
 
     /// Razdvoji pesmu i vrati URL-ove 6 stem .wav fajlova (po StemKind).
     func separate(url: URL) async throws -> [StemKind: URL] {
+        Self.log.notice("[Mazut] separate() pozvan za \(url.lastPathComponent, privacy: .public)")
         // Keš pogodak: pesma je već razdvojena → vrati postojeće stemove odmah.
         let key = try StemCache.key(for: url)
         if let cached = StemCache.stems(for: key) {
-            print("[Mazut] keš pogodak — preskačem razdvajanje (obriši iz biblioteke da bi ponovo merio)")
+            Self.log.notice("[Mazut] keš pogodak — preskačem razdvajanje (obriši iz biblioteke da bi ponovo merio)")
             return cached
         }
 
@@ -46,9 +52,6 @@ nonisolated final class DemucsSeparator {
         let TL = DemucsParams.segmentSamples
         let stride = Int(Double(TL) * (1 - overlap))
 
-        // Izlazni baferi: 6 stemova × 2 kanala × total.
-        var out = [[[Float]]](repeating: [[Float]](repeating: [Float](repeating: 0, count: total), count: 2), count: 6)
-        var wsum = [Float](repeating: 0, count: total)
         let win = olaWindow(TL)
 
         // Pozicije svih segmenata.
@@ -56,14 +59,82 @@ nonisolated final class DemucsSeparator {
         var p = 0
         while p < total { positions.append(p); p += stride }
         let nChunks = positions.count
+        Self.log.notice("[Mazut] učitan zvuk: \(total, privacy: .public) sample-ova, \(nChunks, privacy: .public) segmenata — počinjem")
+
+        // --- Streaming izlaz na disk: po jedan AVAudioFile (AAC) po stemu + klizni
+        // prozor umesto punog `out` bafera (714 MB → ~16 MB; kritično na 4 GB uređaju).
+        // Segmenti idu s leva na desno, overlap 0.1 → svaki sample pokriva ≤2 segmenta,
+        // pa su sample-ovi pre pozicije sledećeg segmenta finalni i upisuju se odmah. ---
+        let dir = StemCache.directory(for: key)
+        let writeFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                     sampleRate: Double(DemucsParams.sampleRate),
+                                     channels: 2, interleaved: false)!
+        let aacSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: Double(DemucsParams.sampleRate),
+            AVNumberOfChannelsKey: 2,
+            AVEncoderBitRateKey: Self.aacBitRate,
+        ]
+        var writers: [AVAudioFile] = []
+        var result: [StemKind: URL] = [:]
+        for s in 0..<6 {
+            let kind = Self.modelOrder[s]
+            let fileURL = dir.appendingPathComponent("\(kind.rawValue).\(StemCache.stemExtension)")
+            try? FileManager.default.removeItem(at: fileURL)
+            writers.append(try AVAudioFile(forWriting: fileURL, settings: aacSettings))
+            result[kind] = fileURL
+        }
+
+        // Klizni prozor: acc[6][2] i wsumW pokrivaju apsolutni opseg [winStart, ...).
+        var winStart = 0
+        var acc = [[[Float]]](repeating: [[Float]](repeating: [], count: 2), count: 6)
+        var wsumW = [Float]()
+
+        // Proširi prozor da pokrije do `end` (apsolutni indeks).
+        func ensureWindow(upTo end: Int) {
+            let add = (end - winStart) - wsumW.count
+            guard add > 0 else { return }
+            wsumW.append(contentsOf: repeatElement(0, count: add))
+            for s in 0..<6 { for c in 0..<2 { acc[s][c].append(contentsOf: repeatElement(0, count: add)) } }
+        }
+
+        // Normalizuj [winStart, end), upiši na disk, pa oslobodi prefiks prozora.
+        func flush(upTo end: Int) throws {
+            let count = end - winStart
+            guard count > 0 else { return }
+            let buf = AVAudioPCMBuffer(pcmFormat: writeFmt, frameCapacity: AVAudioFrameCount(count))!
+            buf.frameLength = AVAudioFrameCount(count)
+            for s in 0..<6 {
+                for c in 0..<2 {
+                    let dst = buf.floatChannelData![c]
+                    let src = acc[s][c]
+                    for i in 0..<count {
+                        let w = wsumW[i]
+                        dst[i] = w > 1e-6 ? max(-1, min(1, src[i] / w)) : 0
+                    }
+                }
+                try writers[s].write(from: buf)
+            }
+            wsumW.removeFirst(count)
+            for s in 0..<6 { for c in 0..<2 { acc[s][c].removeFirst(count) } }
+            winStart = end
+        }
 
         let tWall0 = CFAbsoluteTimeGetCurrent()
+
+        // --- Profil: zbir trajanja po komponenti (sve mereno zasebno, iako su
+        // GPU i CPU preklopljeni). Poređenje pokazuje da li smo GPU- ili CPU-bound. ---
+        var tInferSum = 0.0   // GPU: Core ML prediction
+        var tStftSum = 0.0    // CPU: makeInput (STFT)
+        var tIstftSum = 0.0   // CPU: consume (ISTFT + overlap-add) + upis
 
         // --- Pipeline: dok GPU radi inferenciju segmenta i, CPU paralelno radi
         // ISTFT segmenta i-1 i STFT segmenta i+1 (A1+A2). Drži najviše 2 izlaza u RAM-u. ---
         if nChunks > 0 {
-            var pending: (spec: MLMultiArray, time: MLMultiArray, pos: Int, len: Int)?
+            var pending: (spec: MLMultiArray, time: MLMultiArray, idx: Int, pos: Int, len: Int)?
+            let t0 = CFAbsoluteTimeGetCurrent()
             var nextInput = try makeInput(model: model, mix: mix, pos: positions[0], total: total, TL: TL)
+            tStftSum += CFAbsoluteTimeGetCurrent() - t0
 
             for i in 0..<nChunks {
                 try Task.checkCancellation()   // „Odustani" između segmenata
@@ -76,45 +147,46 @@ nonisolated final class DemucsSeparator {
 
                 // CPU (preklopljeno sa inferencijom): potroši prethodni + pripremi sledeći.
                 if let pend = pending {
+                    let tc = CFAbsoluteTimeGetCurrent()
+                    ensureWindow(upTo: pend.pos + pend.len)
                     consume(spec: pend.spec, time: pend.time, pos: pend.pos, len: pend.len,
-                            out: &out, wsum: &wsum, win: win)
+                            winBase: winStart, acc: &acc, wsum: &wsumW, win: win)
+                    // sample-ovi < pozicija sledećeg segmenta su finalni → upiši i oslobodi.
+                    try flush(upTo: positions[pend.idx + 1])
+                    tIstftSum += CFAbsoluteTimeGetCurrent() - tc
                     pending = nil
                 }
                 if i + 1 < nChunks {
+                    let ts = CFAbsoluteTimeGetCurrent()
                     nextInput = try makeInput(model: model, mix: mix, pos: positions[i + 1], total: total, TL: TL)
+                    tStftSum += CFAbsoluteTimeGetCurrent() - ts
                 }
 
-                let (spec, time) = try await inferred
-                pending = (spec, time, curPos, curLen)
+                let (spec, time, dtInfer) = try await inferred
+                tInferSum += dtInfer
+                pending = (spec, time, i, curPos, curLen)
+                Self.log.notice("[Mazut] segment \(i + 1, privacy: .public)/\(nChunks, privacy: .public): GPU infer \(Int(dtInfer * 1000), privacy: .public)ms")
                 await MainActor.run { self.progress = min(1, Double(i + 1) / Double(nChunks)) }
             }
-            // Poslednji segment.
+            // Poslednji segment: finalizuj sve do kraja.
             if let pend = pending {
+                let tc = CFAbsoluteTimeGetCurrent()
+                ensureWindow(upTo: pend.pos + pend.len)
                 consume(spec: pend.spec, time: pend.time, pos: pend.pos, len: pend.len,
-                        out: &out, wsum: &wsum, win: win)
+                        winBase: winStart, acc: &acc, wsum: &wsumW, win: win)
+                try flush(upTo: total)
+                tIstftSum += CFAbsoluteTimeGetCurrent() - tc
             }
         }
 
         let wall = CFAbsoluteTimeGetCurrent() - tWall0
         let audioSec = Double(total) / Double(DemucsParams.sampleRate)
-        print(String(format: "[Mazut] %d seg | zvuk %.0fs → obrada %.1fs (%.2f× realtime)",
-                     nChunks, audioSec, wall, audioSec / max(wall, 0.001)))
+        Self.log.notice("\(String(format: "[Mazut] %d seg | zvuk %.0fs → obrada %.1fs (%.2f× realtime)", nChunks, audioSec, wall, audioSec / max(wall, 0.001)), privacy: .public)")
+        let n = max(nChunks, 1)
+        Self.log.notice("\(String(format: "[Mazut] profil/segment: GPU infer %.0fms | STFT %.0fms | ISTFT+OLA+upis %.0fms  (CPU ukupno %.0fms vs GPU %.0fms → %@)", tInferSum / Double(n) * 1000, tStftSum / Double(n) * 1000, tIstftSum / Double(n) * 1000, (tStftSum + tIstftSum) / Double(n) * 1000, tInferSum / Double(n) * 1000, tInferSum > (tStftSum + tIstftSum) ? "GPU-bound" : "CPU-bound"), privacy: .public)")
 
-        // Normalizacija overlap-add.
-        for i in 0..<total where wsum[i] > 1e-6 {
-            for s in 0..<6 { for c in 0..<2 { out[s][c][i] /= wsum[i] } }
-        }
-
-        // Upis 6 .wav fajlova u trajni keš (folder = hash sadržaja pesme).
-        var result: [StemKind: URL] = [:]
-        let dir = StemCache.directory(for: key)
-        for s in 0..<6 {
-            let kind = Self.modelOrder[s]
-            let fileURL = dir.appendingPathComponent("\(kind.rawValue).\(StemCache.stemExtension)")
-            try writeStem(channels: out[s], to: fileURL)
-            result[kind] = fileURL
-        }
         StemCache.saveMeta(key: key, name: url.deletingPathExtension().lastPathComponent)
+        await StemCache.saveArtwork(key: key, from: url)   // album art → cover.jpg (ako postoji)
         await MainActor.run { self.progress = 1 }
         return result
     }
@@ -153,18 +225,21 @@ nonisolated final class DemucsSeparator {
 
     /// Core ML inferencija (kao zaseban async task → preklapa se sa CPU radom).
     private func runInference(_ model: MLModel, _ provider: MLFeatureProvider)
-        async throws -> (MLMultiArray, MLMultiArray) {
+        async throws -> (MLMultiArray, MLMultiArray, Double) {
+        let t0 = CFAbsoluteTimeGetCurrent()
         let result = try await model.prediction(from: provider)
+        let dt = CFAbsoluteTimeGetCurrent() - t0
         guard let spec = result.featureValue(for: "spec_out")?.multiArrayValue,
               let time = result.featureValue(for: "time_out")?.multiArrayValue else {
             throw SeparationError.modelOutput
         }
-        return (spec, time)
+        return (spec, time, dt)
     }
 
-    /// ISTFT (12 paralelnih: 6 stemova × 2 kanala) + overlap-add u izlazni bafer.
+    /// ISTFT (12 paralelnih: 6 stemova × 2 kanala) + overlap-add u klizni prozor.
+    /// `winBase` je apsolutni indeks početka prozora → upis na offset `pos - winBase`.
     private func consume(spec: MLMultiArray, time: MLMultiArray, pos: Int, len: Int,
-                         out: inout [[[Float]]], wsum: inout [Float], win: [Float]) {
+                         winBase: Int, acc: inout [[[Float]]], wsum: inout [Float], win: [Float]) {
         // Core ML izlazi imaju padding (strides != kontinualno) — čitamo preko strides.
         let specP = spec.dataPointer.bindMemory(to: Float.self, capacity: spec.strides[0].intValue)
         let timeP = time.dataPointer.bindMemory(to: Float.self, capacity: time.strides[0].intValue)
@@ -184,16 +259,17 @@ nonisolated final class DemucsSeparator {
             }
         }
 
-        // Sekvencijalni overlap-add (deli zajednički `out`/`wsum`).
+        // Sekvencijalni overlap-add u prozor (deli zajednički `acc`/`wsum`).
+        let base = pos - winBase
         for j in 0..<12 {
             let s = j / 2, c = j % 2
             let wav = waves[j]
             let tOff = s * timeStemStride + c * timeChStride
             for i in 0..<len {
-                out[s][c][pos + i] += (wav[i] + timeP[tOff + i]) * win[i]
+                acc[s][c][base + i] += (wav[i] + timeP[tOff + i]) * win[i]
             }
         }
-        for i in 0..<len { wsum[pos + i] += win[i] }
+        for i in 0..<len { wsum[base + i] += win[i] }
     }
 
     // MARK: - Audio I/O
@@ -237,30 +313,7 @@ nonisolated final class DemucsSeparator {
     }
 
     /// Bitrate AAC enkodera po stemu (stereo). 192 kbps ≈ transparentno,
-    /// a ~7× manje od 16-bit PCM .wav (1411 kbps).
+    /// a ~7× manje od 16-bit PCM .wav (1411 kbps). Upis je sada inkrementalan
+    /// (klizni prozor u `separate`), pa nema zasebne `writeStem` funkcije.
     private static let aacBitRate = 192_000
-
-    private func writeStem(channels: [[Float]], to url: URL) throws {
-        let n = channels[0].count
-        let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                sampleRate: Double(DemucsParams.sampleRate),
-                                channels: 2, interleaved: false)!
-        // AAC u .m4a kontejneru. Float buffer (= processingFormat) se interno
-        // enkoduje u AAC pri upisu.
-        let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: Double(DemucsParams.sampleRate),
-            AVNumberOfChannelsKey: 2,
-            AVEncoderBitRateKey: Self.aacBitRate,
-        ]
-        try? FileManager.default.removeItem(at: url)
-        let outFile = try AVAudioFile(forWriting: url, settings: settings)
-        let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(n))!
-        buf.frameLength = AVAudioFrameCount(n)
-        for c in 0..<2 {
-            let dst = buf.floatChannelData![c]
-            for i in 0..<n { dst[i] = max(-1, min(1, channels[c][i])) }
-        }
-        try outFile.write(from: buf)
-    }
 }

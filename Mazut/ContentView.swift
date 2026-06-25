@@ -5,6 +5,24 @@
 
 import SwiftUI
 import UniformTypeIdentifiers
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
+
+/// Učitaj sliku iz fajla u SwiftUI `Image` (cross-platform).
+private func loadArtwork(_ url: URL) -> Image? {
+#if canImport(UIKit)
+    guard let img = UIImage(contentsOfFile: url.path) else { return nil }
+    return Image(uiImage: img)
+#elseif canImport(AppKit)
+    guard let img = NSImage(contentsOfFile: url.path) else { return nil }
+    return Image(nsImage: img)
+#else
+    return nil
+#endif
+}
 
 struct ContentView: View {
     @Environment(\.openURL) private var openURL
@@ -160,8 +178,7 @@ struct ContentView: View {
                             openCached(song)
                         } label: {
                             HStack(spacing: 12) {
-                                Image(systemName: "music.note")
-                                    .foregroundStyle(.secondary)
+                                artworkThumb(song)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(song.name)
                                         .font(.body)
@@ -216,6 +233,27 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent)
             .padding()
+        }
+    }
+
+    /// Sličica pesme: ugrađeni album art ako postoji, inače placeholder s notom.
+    @ViewBuilder
+    private func artworkThumb(_ song: CachedSong) -> some View {
+        let side: CGFloat = 44
+        if let url = song.artworkURL, let img = loadArtwork(url) {
+            img
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: side, height: side)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+        } else {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(.quaternary)
+                .frame(width: side, height: side)
+                .overlay {
+                    Image(systemName: "music.note")
+                        .foregroundStyle(.secondary)
+                }
         }
     }
 
