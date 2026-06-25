@@ -97,12 +97,16 @@ nonisolated final class DemucsSeparator {
         }
 
         // Normalizuj [winStart, end), upiši na disk, pa oslobodi prefiks prozora.
+        // AAC enkodovanje 6 stemova je glavno usko grlo → 6 stemova paralelno
+        // (svaki svoj AVAudioFile + bafer, nezavisno na svojoj niti).
         func flush(upTo end: Int) throws {
             let count = end - winStart
             guard count > 0 else { return }
-            let buf = AVAudioPCMBuffer(pcmFormat: writeFmt, frameCapacity: AVAudioFrameCount(count))!
-            buf.frameLength = AVAudioFrameCount(count)
-            for s in 0..<6 {
+            let errLock = NSLock()
+            var writeErr: Error?
+            DispatchQueue.concurrentPerform(iterations: 6) { s in
+                let buf = AVAudioPCMBuffer(pcmFormat: writeFmt, frameCapacity: AVAudioFrameCount(count))!
+                buf.frameLength = AVAudioFrameCount(count)
                 for c in 0..<2 {
                     let dst = buf.floatChannelData![c]
                     let src = acc[s][c]
@@ -111,8 +115,10 @@ nonisolated final class DemucsSeparator {
                         dst[i] = w > 1e-6 ? max(-1, min(1, src[i] / w)) : 0
                     }
                 }
-                try writers[s].write(from: buf)
+                do { try writers[s].write(from: buf) }
+                catch { errLock.lock(); writeErr = error; errLock.unlock() }
             }
+            if let writeErr { throw writeErr }
             wsumW.removeFirst(count)
             for s in 0..<6 { for c in 0..<2 { acc[s][c].removeFirst(count) } }
             winStart = end
@@ -124,7 +130,8 @@ nonisolated final class DemucsSeparator {
         // GPU i CPU preklopljeni). Poređenje pokazuje da li smo GPU- ili CPU-bound. ---
         var tInferSum = 0.0   // GPU: Core ML prediction
         var tStftSum = 0.0    // CPU: makeInput (STFT)
-        var tIstftSum = 0.0   // CPU: consume (ISTFT + overlap-add) + upis
+        var tIstftSum = 0.0   // CPU: consume (ISTFT + overlap-add)
+        var tWriteSum = 0.0   // CPU: flush (normalizacija + AAC upis 6 stemova)
 
         // --- Pipeline: dok GPU radi inferenciju segmenta i, CPU paralelno radi
         // ISTFT segmenta i-1 i STFT segmenta i+1 (A1+A2). Drži najviše 2 izlaza u RAM-u. ---
@@ -149,9 +156,11 @@ nonisolated final class DemucsSeparator {
                     ensureWindow(upTo: pend.pos + pend.len)
                     consume(spec: pend.spec, time: pend.time, pos: pend.pos, len: pend.len,
                             winBase: winStart, acc: &acc, wsum: &wsumW, win: win)
+                    let tw = CFAbsoluteTimeGetCurrent()
+                    tIstftSum += tw - tc
                     // sample-ovi < pozicija sledećeg segmenta su finalni → upiši i oslobodi.
                     try flush(upTo: positions[pend.idx + 1])
-                    tIstftSum += CFAbsoluteTimeGetCurrent() - tc
+                    tWriteSum += CFAbsoluteTimeGetCurrent() - tw
                     pending = nil
                 }
                 if i + 1 < nChunks {
@@ -172,8 +181,10 @@ nonisolated final class DemucsSeparator {
                 ensureWindow(upTo: pend.pos + pend.len)
                 consume(spec: pend.spec, time: pend.time, pos: pend.pos, len: pend.len,
                         winBase: winStart, acc: &acc, wsum: &wsumW, win: win)
+                let tw = CFAbsoluteTimeGetCurrent()
+                tIstftSum += tw - tc
                 try flush(upTo: total)
-                tIstftSum += CFAbsoluteTimeGetCurrent() - tc
+                tWriteSum += CFAbsoluteTimeGetCurrent() - tw
             }
         }
 
@@ -181,7 +192,8 @@ nonisolated final class DemucsSeparator {
         let audioSec = Double(total) / Double(DemucsParams.sampleRate)
         Self.log.notice("\(String(format: "[Mazut] %d seg | zvuk %.0fs → obrada %.1fs (%.2f× realtime)", nChunks, audioSec, wall, audioSec / max(wall, 0.001)), privacy: .public)")
         let n = max(nChunks, 1)
-        Self.log.notice("\(String(format: "[Mazut] profil/segment: GPU infer %.0fms | STFT %.0fms | ISTFT+OLA+upis %.0fms  (CPU ukupno %.0fms vs GPU %.0fms → %@)", tInferSum / Double(n) * 1000, tStftSum / Double(n) * 1000, tIstftSum / Double(n) * 1000, (tStftSum + tIstftSum) / Double(n) * 1000, tInferSum / Double(n) * 1000, tInferSum > (tStftSum + tIstftSum) ? "GPU-bound" : "CPU-bound"), privacy: .public)")
+        let cpuPer = (tStftSum + tIstftSum + tWriteSum) / Double(n) * 1000
+        Self.log.notice("\(String(format: "[Mazut] profil/segment: GPU %.0fms | STFT %.0fms | ISTFT %.0fms | AAC upis %.0fms  (CPU ukupno %.0fms vs GPU %.0fms → %@)", tInferSum / Double(n) * 1000, tStftSum / Double(n) * 1000, tIstftSum / Double(n) * 1000, tWriteSum / Double(n) * 1000, cpuPer, tInferSum / Double(n) * 1000, tInferSum / Double(n) * 1000 > cpuPer ? "GPU-bound" : "CPU-bound"), privacy: .public)")
 
         StemCache.saveMeta(key: key, name: url.deletingPathExtension().lastPathComponent)
         await StemCache.saveArtwork(key: key, from: url)   // album art → cover.jpg (ako postoji)
@@ -238,22 +250,33 @@ nonisolated final class DemucsSeparator {
     /// `winBase` je apsolutni indeks početka prozora → upis na offset `pos - winBase`.
     private func consume(spec: MLMultiArray, time: MLMultiArray, pos: Int, len: Int,
                          winBase: Int, acc: inout [[[Float]]], wsum: inout [Float], win: [Float]) {
-        // Core ML izlazi imaju padding (strides != kontinualno) — čitamo preko strides.
-        let specP = spec.dataPointer.bindMemory(to: Float.self, capacity: spec.strides[0].intValue)
-        let timeP = time.dataPointer.bindMemory(to: Float.self, capacity: time.strides[0].intValue)
+        // spec_out se u ISTFT-u čita STRIDED (re[k*T+t], korak T). Kopiramo ga u
+        // kontinualni CPU bafer jednom (sekvencijalni memcpy), pa ISTFT radi iz RAM-a —
+        // izbegava strided pristup GPU-backed Core ML izlazu. (spec_out je kontinualan,
+        // vidi README; time_out se čita sekvencijalno pa ostaje preko strides.)
         let specStemStride = spec.strides[1].intValue
         let specChStride = spec.strides[2].intValue   // jedan cac kanal (F*T, kontinualno)
+        let specSize = spec.strides[0].intValue
+        var specBuf = [Float](repeating: 0, count: specSize)
+        specBuf.withUnsafeMutableBufferPointer { dst in
+            memcpy(dst.baseAddress!, spec.dataPointer, specSize * MemoryLayout<Float>.size)
+        }
+
+        let timeP = time.dataPointer.bindMemory(to: Float.self, capacity: time.strides[0].intValue)
         let timeStemStride = time.strides[1].intValue
         let timeChStride = time.strides[2].intValue
 
         // Paralelni ISTFT: 12 nezavisnih (stem,kanal) → svaki piše u svoj slot.
         var waves = [[Float]](repeating: [], count: 12)
-        waves.withUnsafeMutableBufferPointer { wbuf in
-            DispatchQueue.concurrentPerform(iterations: 12) { j in
-                let s = j / 2, c = j % 2
-                let reOff = s * specStemStride + (2 * c) * specChStride
-                let imOff = s * specStemStride + (2 * c + 1) * specChStride
-                wbuf[j] = dsp.istftChannel(re: specP + reOff, im: specP + imOff)
+        specBuf.withUnsafeBufferPointer { sp in
+            let specP = sp.baseAddress!
+            waves.withUnsafeMutableBufferPointer { wbuf in
+                DispatchQueue.concurrentPerform(iterations: 12) { j in
+                    let s = j / 2, c = j % 2
+                    let reOff = s * specStemStride + (2 * c) * specChStride
+                    let imOff = s * specStemStride + (2 * c + 1) * specChStride
+                    wbuf[j] = dsp.istftChannel(re: specP + reOff, im: specP + imOff)
+                }
             }
         }
 
