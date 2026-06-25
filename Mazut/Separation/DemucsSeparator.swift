@@ -35,7 +35,6 @@ nonisolated final class DemucsSeparator {
 
     /// Razdvoji pesmu i vrati URL-ove 6 stem .wav fajlova (po StemKind).
     func separate(url: URL) async throws -> [StemKind: URL] {
-        Self.log.notice("[Mazut] separate() pozvan za \(url.lastPathComponent, privacy: .public)")
         // Keš pogodak: pesma je već razdvojena → vrati postojeće stemove odmah.
         let key = try StemCache.key(for: url)
         if let cached = StemCache.stems(for: key) {
@@ -59,7 +58,6 @@ nonisolated final class DemucsSeparator {
         var p = 0
         while p < total { positions.append(p); p += stride }
         let nChunks = positions.count
-        Self.log.notice("[Mazut] učitan zvuk: \(total, privacy: .public) sample-ova, \(nChunks, privacy: .public) segmenata — počinjem")
 
         // --- Streaming izlaz na disk: po jedan AVAudioFile (AAC) po stemu + klizni
         // prozor umesto punog `out` bafera (714 MB → ~16 MB; kritično na 4 GB uređaju).
@@ -165,7 +163,7 @@ nonisolated final class DemucsSeparator {
                 let (spec, time, dtInfer) = try await inferred
                 tInferSum += dtInfer
                 pending = (spec, time, i, curPos, curLen)
-                Self.log.notice("[Mazut] segment \(i + 1, privacy: .public)/\(nChunks, privacy: .public): GPU infer \(Int(dtInfer * 1000), privacy: .public)ms")
+                Self.log.debug("[Mazut] segment \(i + 1, privacy: .public)/\(nChunks, privacy: .public): GPU infer \(Int(dtInfer * 1000), privacy: .public)ms")
                 await MainActor.run { self.progress = min(1, Double(i + 1) / Double(nChunks)) }
             }
             // Poslednji segment: finalizuj sve do kraja.
