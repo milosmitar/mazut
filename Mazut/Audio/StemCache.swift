@@ -10,14 +10,28 @@
 
 import Foundation
 import CryptoKit
+import AVFoundation
 
 /// Jedna keširana pesma za prikaz u biblioteci.
 nonisolated struct CachedSong: Identifiable {
     let id: String              // ključ = hash sadržaja
     let name: String            // originalno ime fajla (za prikaz)
     let date: Date              // kada je razdvojena
+    let duration: TimeInterval  // trajanje pesme (sekunde)
     let stems: [StemKind: URL]  // putanje 6 stem .wav fajlova
     let size: Int64             // zauzeće na disku (bajtovi)
+
+    /// Izvođač iz naziva oblika „Izvođač - Naslov" (prazan ako nema separatora).
+    var artist: String {
+        guard let r = name.range(of: " - ") else { return "" }
+        return String(name[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Naslov bez izvođača (ceo naziv ako nema separatora).
+    var title: String {
+        guard let r = name.range(of: " - ") else { return name }
+        return String(name[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+    }
 }
 
 nonisolated enum StemCache {
@@ -94,15 +108,36 @@ nonisolated enum StemCache {
 
             var name = key
             var date = Date.distantPast
-            if let data = try? Data(contentsOf: dir.appendingPathComponent("meta.json")),
+            var meta: [String: String] = [:]
+            let metaURL = dir.appendingPathComponent("meta.json")
+            if let data = try? Data(contentsOf: metaURL),
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
-                name = json["name"] ?? name
-                if let d = json["date"], let parsed = iso.date(from: d) { date = parsed }
+                meta = json
+                name = meta["name"] ?? name
+                if let d = meta["date"], let parsed = iso.date(from: d) { date = parsed }
             }
-            songs.append(CachedSong(id: key, name: name, date: date,
+
+            // Trajanje se računa jednom i keširaj u meta.json (čitanje audija je sporo).
+            var duration = meta["duration"].flatMap(TimeInterval.init) ?? 0
+            if duration == 0, let any = stems[.vocals] ?? stems.values.first {
+                duration = audioDuration(of: any)
+                meta["duration"] = String(duration)
+                if let data = try? JSONSerialization.data(withJSONObject: meta) {
+                    try? data.write(to: metaURL)
+                }
+            }
+
+            songs.append(CachedSong(id: key, name: name, date: date, duration: duration,
                                     stems: stems, size: folderSize(dir)))
         }
         return songs.sorted { $0.date > $1.date }
+    }
+
+    /// Trajanje audio fajla u sekundama (0 ako se ne može pročitati).
+    private static func audioDuration(of url: URL) -> TimeInterval {
+        guard let file = try? AVAudioFile(forReading: url) else { return 0 }
+        let sr = file.processingFormat.sampleRate
+        return sr > 0 ? Double(file.length) / sr : 0
     }
 
     /// Ukupno zauzeće keša na disku (bajtovi).

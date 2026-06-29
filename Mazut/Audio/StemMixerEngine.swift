@@ -22,6 +22,10 @@ final class StemMixerEngine {
     var currentTime: TimeInterval = 0
     private(set) var isLoaded = false
 
+    /// Pozove se (na glavnoj niti) kada pesma stigne prirodno do kraja —
+    /// koristi se za automatski prelazak na sledeću pesmu.
+    var onPlaybackFinished: (() -> Void)?
+
     // MARK: - Audio graf
 
     private let engine = AVAudioEngine()
@@ -237,11 +241,12 @@ final class StemMixerEngine {
             guard let self else { return }
             let frame = self.currentFrame()
             self.currentTime = min(Double(frame) / self.sampleRate, self.duration)
-            // Auto-stop na kraju pesme.
+            // Kraj pesme: zaustavi i javi (auto-prelazak na sledeću).
             if frame >= self.totalFrames, self.totalFrames > 0 {
                 self.pause()
                 self.seekFrame = 0
                 self.currentTime = 0
+                self.onPlaybackFinished?()
             }
         }
     }
