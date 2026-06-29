@@ -160,7 +160,43 @@ kanal-stride **343984** (padding na poravnanje ×16), ne 343980. `spec_out` jest
 kontinualan (336, 2048 deljivi sa 16). MORA se čitati preko `.strides`, inače je
 time grana polomljena (~2 dB) dok spektralna izgleda ok — podmukao bug.
 
-### Preostalo (runtime, ne-numerički)
+### ✓ fp16 model + ANE istraga + nalaz o brzini (2026-06)
 
-- Živi test u simulatoru/na uređaju: izabrati pesmu → „Razdvoj" → slušati stemove.
-- Brzina na uređaju (fp32 = CPU/GPU, ne ANE); eventualno mixed-precision kasnije.
+Cilj je bila brzina. Redosled saznanja (sve mereno na iPhone 13 mini):
+
+**1. Model precision (`convert_mixed.py`, `snr_check.py`).** SNR mixed/fp16 modela
+vs PyTorch core, **po compute unit-u**:
+
+| Compute unit | spec SNR | time SNR |
+|--------------|----------|----------|
+| CPU_ONLY     |  26.6 dB |  23.9 dB |
+| **CPU_AND_GPU** | **57.4 dB** | **54.1 dB** |
+| ALL (ANE)    | **−28 dB** | **−1.6 dB** |
+
+- **fp16 na CPU_AND_GPU je odličan (54 dB)** — stari nalaz „fp16 ubija time granu
+  (2.4 dB)" više NE važi (coremltools 9 + iOS18 drži fp16 akumulaciju u fp32 na GPU).
+- **ANE (`.all`) daje smeće** — i sa punim fp16 i sa mixed-precision (fp32 ostrva).
+  Pošto i čist fp16 puca na ANE, ni podela na dva modela ne bi pomogla. **ANE put je
+  zatvoren za ovaj model.** Ostaje `computeUnits = .cpuAndGPU`.
+- **fp16 model MORA imati fp32 izlaze** (`ct.TensorType(dtype=np.float32)`), inače Swift
+  `consume()` čita Float16 kao Float32 → `EXC_BAD_ACCESS`. Interni račun ostaje fp16.
+- Izabran **fp16** (72 MB) umesto int8 (37 MB): brži GPU (~720 vs ~1000 ms/seg) i bolji
+  kvalitet (54 vs ~28 dB). int8 ostaje opcija ako je veličina app-a kritična.
+
+**2. Profil i pravo usko grlo (`bench_istft.swift`).** U **Release**-u je obrada
+**GPU-bound**: ~720 ms/seg, ~22 s za 3.5-min pesmu (~9.5× realtime). Po segmentu:
+GPU ~720 ms | STFT ~14 ms | ISTFT ~96 ms | AAC upis ~77 ms.
+
+> ⚠ **PROFILIŠI ISKLJUČIVO U RELEASE.** Swift `-Onone` (Debug) naduvava vDSP DSP petlje
+> (STFT/ISTFT) **~50–60×** (ISTFT 96 ms → ~5600 ms), pa separacija lažno izgleda
+> CPU/ISTFT-bound. `bench_istft.swift` (`-O`) pokazuje ISTFT ~12 ms na RAM-u → algoritam
+> nije problem. Cela jedna istraga je potrošena jureći taj Debug artefakt.
+
+**3. App-side popravke** (`DemucsSeparator`): kopija `spec_out` u kontinualni RAM pre
+ISTFT-a (izbegava strided pristup GPU-backed izlazu), paralelni AAC upis 6 stemova,
+razdvojeni profiling tajmeri.
+
+### Preostalo / ideje za brzinu
+
+- Već GPU-bound na `.cpuAndGPU`; dalja brzina znači sam model (ANE je mrtav).
+- Eventualno: int8 težine + fp16 račun (37 MB + brz GPU) ako treba manji app.
