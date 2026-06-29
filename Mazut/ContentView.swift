@@ -31,6 +31,7 @@ struct ContentView: View {
 
     @State private var engine = StemMixerEngine()
     @State private var separator = DemucsSeparator()
+    @State private var metronome = Metronome()
     @State private var stems: [Stem] = StemKind.allCases.map { Stem(kind: $0) }
     @State private var showImporter = false
     /// true = „Razdvoj pesmu" (jedan fajl → separacija), false = „Učitaj gotove stemove" (više fajlova).
@@ -302,18 +303,92 @@ struct ContentView: View {
 
     private var metronomeTab: some View {
         NavigationStack {
-            VStack(spacing: 16) {
-                Image(systemName: "metronome")
-                    .font(.system(size: 56))
-                    .foregroundStyle(.secondary)
-                Text("Metronom")
-                    .font(.title2.bold())
-                Text("Uskoro…")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+            VStack(spacing: 28) {
+                Spacer()
+
+                // Tempo
+                VStack(spacing: 2) {
+                    Text("\(metronome.bpm)")
+                        .font(.system(size: 76, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                    Text("BPM")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                }
+
+                // Indikator dobara
+                HStack(spacing: 14) {
+                    ForEach(0..<metronome.beatsPerMeasure, id: \.self) { i in
+                        Circle()
+                            .fill(beatColor(i))
+                            .frame(width: 18, height: 18)
+                            .scaleEffect(metronome.beatsPerMeasure > 1
+                                         && metronome.isRunning && i == metronome.currentBeat ? 1.35 : 1)
+                            .animation(.easeOut(duration: 0.08), value: metronome.currentBeat)
+                    }
+                }
+                .frame(height: 28)
+
+                // Podešavanje tempa
+                HStack(spacing: 20) {
+                    Button { metronome.bpm = max(40, metronome.bpm - 1) } label: {
+                        Image(systemName: "minus.circle.fill").font(.largeTitle)
+                    }
+                    Slider(
+                        value: Binding(
+                            get: { Double(metronome.bpm) },
+                            set: { metronome.bpm = Int($0.rounded()) }
+                        ),
+                        in: 40...240, step: 1
+                    )
+                    Button { metronome.bpm = min(240, metronome.bpm + 1) } label: {
+                        Image(systemName: "plus.circle.fill").font(.largeTitle)
+                    }
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal)
+
+                // Takt (broj dobara)
+                Picker("Takt", selection: $metronome.beatsPerMeasure) {
+                    ForEach([1, 2, 3, 4, 6], id: \.self) { n in
+                        Text(n == 1 ? "1/1" : "\(n)/4").tag(n)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal)
+
+                // Start / Stop
+                Button {
+                    metronome.toggle()
+                } label: {
+                    Label(metronome.isRunning ? "Stop" : "Start",
+                          systemImage: metronome.isRunning ? "stop.fill" : "play.fill")
+                        .font(.title3.bold())
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(metronome.isRunning ? .red : .accentColor)
+                .padding(.horizontal)
+
+                Spacer()
             }
+            .padding()
             .navigationTitle("Metronom")
         }
+    }
+
+    /// Boja kružića dobra: aktivan dobar svetli (prvi crveno, ostali akcenat).
+    /// U 1/1 boja se ne menja po dobru — stalna dok svira.
+    private func beatColor(_ i: Int) -> Color {
+        if metronome.beatsPerMeasure == 1 {
+            return metronome.isRunning ? .accentColor : Color.gray.opacity(0.3)
+        }
+        if metronome.isRunning && i == metronome.currentBeat {
+            return i == 0 ? .red : .accentColor
+        }
+        return Color.gray.opacity(0.3)
     }
 
     // MARK: - „Dodaj u plejlistu" (swipe udesno)
@@ -644,8 +719,52 @@ struct ContentView: View {
                 }
                 .disabled(!canGoNext)
             }
+
+            metronomeBar
         }
         .padding()
+    }
+
+    /// Kompaktna metronom traka ispod transport dugmadi — pali/gasi + tempo.
+    /// Metronom svira preko pesme i zadržava stanje između pesama u plejlisti.
+    private var metronomeBar: some View {
+        HStack(spacing: 14) {
+            Button {
+                metronome.toggle()
+            } label: {
+                Image(systemName: "metronome")
+                    .font(.title3)
+                    .foregroundStyle(metronome.isRunning ? Color.accentColor : .secondary)
+            }
+            .buttonStyle(.plain)
+
+            // Živi pokazivač dobra.
+            Circle()
+                .fill(metronomeDotColor)
+                .frame(width: 10, height: 10)
+                .animation(.easeOut(duration: 0.08), value: metronome.currentBeat)
+
+            Spacer()
+
+            Button { metronome.bpm = max(40, metronome.bpm - 1) } label: {
+                Image(systemName: "minus.circle")
+            }
+            Text("\(metronome.bpm) BPM")
+                .font(.subheadline.monospacedDigit())
+                .frame(minWidth: 78)
+            Button { metronome.bpm = min(240, metronome.bpm + 1) } label: {
+                Image(systemName: "plus.circle")
+            }
+        }
+        .buttonStyle(.plain)
+        .font(.title3)
+        .padding(.top, 4)
+    }
+
+    private var metronomeDotColor: Color {
+        guard metronome.isRunning else { return Color.gray.opacity(0.3) }
+        if metronome.beatsPerMeasure > 1 && metronome.currentBeat == 0 { return .red }
+        return .accentColor
     }
 
     // MARK: - Stemovi
