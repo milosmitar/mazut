@@ -215,12 +215,14 @@ final class StemMixerEngine {
 
     /// Zakazi reprodukciju svih fajlova od seekFrame do kraja.
     private func scheduleFromSeekFrame() {
+        // Odbrana: startingFrame mora biti u [0, file.length].
+        let start = max(0, seekFrame)
         for (_, track) in tracks {
             guard let file = track.file else { continue }
-            let frameCount = AVAudioFrameCount(max(0, file.length - seekFrame))
+            let frameCount = AVAudioFrameCount(max(0, file.length - start))
             guard frameCount > 0 else { continue }
             track.player.scheduleSegment(file,
-                                         startingFrame: seekFrame,
+                                         startingFrame: start,
                                          frameCount: frameCount,
                                          at: nil)
         }
@@ -232,7 +234,9 @@ final class StemMixerEngine {
               let nodeTime = player.lastRenderTime,
               let playerTime = player.playerTime(forNodeTime: nodeTime)
         else { return seekFrame }
-        return seekFrame + playerTime.sampleTime
+        // Pre nego sto zakazani `play(at:)` start stigne, sampleTime je negativan;
+        // ne dozvoli da pozicija (a samim tim i seekFrame) padne ispod nule.
+        return max(0, seekFrame + playerTime.sampleTime)
     }
 
     private func startDisplayTimer() {

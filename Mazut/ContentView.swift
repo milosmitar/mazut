@@ -32,6 +32,7 @@ struct ContentView: View {
     @State private var engine = StemMixerEngine()
     @State private var separator = DemucsSeparator()
     @State private var metronome = Metronome()
+    @State private var tuner = Tuner()
     @State private var stems: [Stem] = StemKind.allCases.map { Stem(kind: $0) }
     @State private var showImporter = false
     /// true = „Razdvoj pesmu" (jedan fajl → separacija), false = „Učitaj gotove stemove" (više fajlova).
@@ -116,6 +117,13 @@ struct ContentView: View {
             metronomeTab
                 .tabItem { Label("Metronom", systemImage: "metronome") }
                 .tag(2)
+            tunerTab
+                .tabItem { Label("Štimer", systemImage: "tuningfork") }
+                .tag(3)
+        }
+        .onChange(of: selectedTab) { _, newValue in
+            // Štimer snima samo dok je njegov tab otvoren.
+            if newValue != 3 { tuner.stop() }
         }
     }
 
@@ -389,6 +397,107 @@ struct ContentView: View {
             return i == 0 ? .red : .accentColor
         }
         return Color.gray.opacity(0.3)
+    }
+
+    // MARK: - Tab: Štimer (tuner za gitaru)
+
+    /// U štimu kad postoji signal i odstupanje je manje od 5 centi.
+    private var tunerInTune: Bool { tuner.hasSignal && abs(tuner.cents) < 5 }
+
+    private var tunerTab: some View {
+        NavigationStack {
+            VStack(spacing: 28) {
+                // Izbor štima
+                Picker("Štim", selection: $tuner.tuning) {
+                    ForEach(GuitarTuning.all) { Text($0.name).tag($0) }
+                }
+                .pickerStyle(.menu)
+
+                Spacer()
+
+                // Velika nota + odstupanje
+                VStack(spacing: 4) {
+                    Text(tuner.hasSignal ? tuner.noteNameWithOctave : "—")
+                        .font(.system(size: 88, weight: .bold, design: .rounded))
+                        .foregroundStyle(tunerInTune ? Color.green : .primary)
+                        .contentTransition(.numericText())
+                        .animation(.easeOut(duration: 0.12), value: tuner.midiNote)
+                    Text(tuner.hasSignal
+                         ? "\(tuner.cents >= 0 ? "+" : "")\(Int(tuner.cents.rounded())) c · \(Int(tuner.frequency.rounded())) Hz"
+                         : "odsviraj žicu")
+                        .font(.headline)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+
+                centsMeter
+
+                // Ciljne žice (sakriveno u hromatskom režimu)
+                if !tuner.tuning.isChromatic {
+                    let nearest = tuner.hasSignal
+                        ? tuner.tuning.nearestString(toMidi: tuner.midiNote) : nil
+                    HStack(spacing: 10) {
+                        ForEach(Array(tuner.tuning.strings.enumerated()), id: \.offset) { idx, midi in
+                            Text(Tuner.noteName(forMidi: midi, withOctave: true))
+                                .font(.subheadline.bold())
+                                .monospacedDigit()
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 10)
+                                .background(stringChipColor(isNearest: idx == nearest))
+                                .foregroundStyle(idx == nearest ? .white : .primary)
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                        }
+                    }
+                }
+
+                if tuner.permissionDenied {
+                    Text("Pristup mikrofonu je odbijen. Uključi ga u Podešavanja → Mazut → Mikrofon.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("Štimer")
+            .onAppear { tuner.start() }
+            .onDisappear { tuner.stop() }
+        }
+    }
+
+    /// Horizontalni indikator centi: centar = u štimu, igla klizi levo/desno.
+    private var centsMeter: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let frac = max(-1, min(1, tuner.cents / 50))   // −50…+50 c → −1…+1
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.gray.opacity(0.2))
+                    .frame(height: 6)
+                    .frame(maxHeight: .infinity, alignment: .center)
+                // Centralna oznaka
+                Rectangle()
+                    .fill(Color.secondary)
+                    .frame(width: 2)
+                    .position(x: w / 2, y: geo.size.height / 2)
+                // Igla
+                Circle()
+                    .fill(tunerInTune ? Color.green : Color.accentColor)
+                    .frame(width: 22, height: 22)
+                    .position(x: w / 2 + CGFloat(frac) * (w / 2 - 11),
+                              y: geo.size.height / 2)
+                    .opacity(tuner.hasSignal ? 1 : 0.25)
+                    .animation(.easeOut(duration: 0.08), value: tuner.cents)
+            }
+        }
+        .frame(height: 44)
+        .padding(.horizontal)
+    }
+
+    private func stringChipColor(isNearest: Bool) -> Color {
+        guard isNearest else { return Color.gray.opacity(0.15) }
+        return tunerInTune ? .green : .accentColor
     }
 
     // MARK: - „Dodaj u plejlistu" (swipe udesno)
