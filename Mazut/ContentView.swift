@@ -29,7 +29,10 @@ struct ContentView: View {
     /// Eksterni izvor pesama (otvara se u pregledaču).
     private let downloadURL = URL(string: "https://st-tancpol.ru/music")!
 
-    @State private var engine = StemMixerEngine()
+    // Deljena instanca: SwiftUI ume više puta da izvrši inicijalizator view-a,
+    // a svaki `StemMixerEngine()` bi iznova vezao globalne mostove (remote
+    // komande, Live Activity) za novu praznu instancu — v. StemMixerEngine.shared.
+    @State private var engine = StemMixerEngine.shared
     @State private var separator = DemucsSeparator()
     @State private var metronome = Metronome()
     @State private var tuner = Tuner()

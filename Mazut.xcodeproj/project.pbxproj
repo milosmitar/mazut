@@ -6,8 +6,37 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		AA110001000000000000000B /* MazutWidgetExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = AA1100010000000000000001 /* MazutWidgetExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		AA110001000000000000000C /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 459D6F452FEA9E82006B822B /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = AA1100010000000000000003;
+			remoteInfo = MazutWidgetExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		AA110001000000000000000A /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				AA110001000000000000000B /* MazutWidgetExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		459D6F4D2FEA9E82006B822B /* Mazut.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Mazut.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA1100010000000000000001 /* MazutWidgetExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MazutWidgetExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -15,6 +44,20 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
+			);
+			target = 459D6F4C2FEA9E82006B822B /* Mazut */;
+		};
+		AA110001000000000000000E /* Exceptions for "MazutWidget" folder in "MazutWidgetExtension" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = AA1100010000000000000003 /* MazutWidgetExtension */;
+		};
+		AA110001000000000000000F /* Exceptions for "MazutWidget" folder in "Mazut" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				StemActivityShared.swift,
 			);
 			target = 459D6F4C2FEA9E82006B822B /* Mazut */;
 		};
@@ -29,10 +72,26 @@
 			path = Mazut;
 			sourceTree = "<group>";
 		};
+		AA1100010000000000000002 /* MazutWidget */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				AA110001000000000000000E /* Exceptions for "MazutWidget" folder in "MazutWidgetExtension" target */,
+				AA110001000000000000000F /* Exceptions for "MazutWidget" folder in "Mazut" target */,
+			);
+			path = MazutWidget;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		459D6F4A2FEA9E82006B822B /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AA1100010000000000000005 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -46,6 +105,7 @@
 			isa = PBXGroup;
 			children = (
 				459D6F4F2FEA9E82006B822B /* Mazut */,
+				AA1100010000000000000002 /* MazutWidget */,
 				459D6F4E2FEA9E82006B822B /* Products */,
 			);
 			sourceTree = "<group>";
@@ -54,6 +114,7 @@
 			isa = PBXGroup;
 			children = (
 				459D6F4D2FEA9E82006B822B /* Mazut.app */,
+				AA1100010000000000000001 /* MazutWidgetExtension.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -68,10 +129,12 @@
 				459D6F492FEA9E82006B822B /* Sources */,
 				459D6F4A2FEA9E82006B822B /* Frameworks */,
 				459D6F4B2FEA9E82006B822B /* Resources */,
+				AA110001000000000000000A /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				AA110001000000000000000D /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				459D6F4F2FEA9E82006B822B /* Mazut */,
@@ -82,6 +145,28 @@
 			productName = Mazut;
 			productReference = 459D6F4D2FEA9E82006B822B /* Mazut.app */;
 			productType = "com.apple.product-type.application";
+		};
+		AA1100010000000000000003 /* MazutWidgetExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AA1100010000000000000007 /* Build configuration list for PBXNativeTarget "MazutWidgetExtension" */;
+			buildPhases = (
+				AA1100010000000000000004 /* Sources */,
+				AA1100010000000000000005 /* Frameworks */,
+				AA1100010000000000000006 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				AA1100010000000000000002 /* MazutWidget */,
+			);
+			name = MazutWidgetExtension;
+			packageProductDependencies = (
+			);
+			productName = MazutWidgetExtension;
+			productReference = AA1100010000000000000001 /* MazutWidgetExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -113,12 +198,20 @@
 			projectRoot = "";
 			targets = (
 				459D6F4C2FEA9E82006B822B /* Mazut */,
+				AA1100010000000000000003 /* MazutWidgetExtension */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		459D6F4B2FEA9E82006B822B /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AA1100010000000000000006 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -135,7 +228,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		AA1100010000000000000004 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		AA110001000000000000000D /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = AA1100010000000000000003 /* MazutWidgetExtension */;
+			targetProxy = AA110001000000000000000C /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		459D6F562FEA9E83006B822B /* Debug */ = {
@@ -325,6 +433,64 @@
 			};
 			name = Release;
 		};
+		AA1100010000000000000008 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = J94E9N656K;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = MazutWidget/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Mazut kanali";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tarmi.Mazut.MazutWidget;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		AA1100010000000000000009 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = J94E9N656K;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = MazutWidget/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Mazut kanali";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.tarmi.Mazut.MazutWidget;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -342,6 +508,15 @@
 			buildConfigurations = (
 				459D6F592FEA9E83006B822B /* Debug */,
 				459D6F5A2FEA9E83006B822B /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		AA1100010000000000000007 /* Build configuration list for PBXNativeTarget "MazutWidgetExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AA1100010000000000000008 /* Debug */,
+				AA1100010000000000000009 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

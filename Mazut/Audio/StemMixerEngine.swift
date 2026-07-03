@@ -10,6 +10,7 @@
 import AVFoundation
 import MediaPlayer
 import Observation
+import os
 #if canImport(UIKit)
 import UIKit
 #elseif canImport(AppKit)
@@ -18,6 +19,12 @@ import AppKit
 
 @Observable
 final class StemMixerEngine {
+
+    /// Jedina instanca. Engine u `init()` vezuje globalne mostove (remote
+    /// komande, prekidi sesije, StemToggleBox za Live Activity) — sme da
+    /// postoji samo jedan, inače poslednja konstruisana (prazna) instanca
+    /// pregazi mostove i dugmići sa zaključanog ekrana rade u prazno.
+    static let shared = StemMixerEngine()
 
     // MARK: - Javno stanje (UI ga posmatra)
 
@@ -67,12 +74,19 @@ final class StemMixerEngine {
     private var npArtist = ""
     private var npArtwork: MPMediaItemArtwork?
 
-    init() {
+    /// Live Activity kartica sa dugmićima za kanale na zaključanom ekranu.
+    private let liveActivity = StemActivityController()
+
+    private init() {
         for kind in StemKind.allCases {
             tracks[kind] = Track()
         }
         setupRemoteCommands()
         observeInterruptions()
+        // Dugme na Live Activity kartici → pali/gasi kanal.
+        StemToggleBox.shared.onToggle = { [weak self] index in
+            self?.toggleStem(at: index)
+        }
     }
 
     // MARK: - Ucitavanje
@@ -137,6 +151,7 @@ final class StemMixerEngine {
         npArtist = ""
         npArtwork = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        liveActivity.end()
     }
 
     // MARK: - Transport
@@ -161,6 +176,7 @@ final class StemMixerEngine {
             isPlaying = true
             startDisplayTimer()
             updateNowPlayingInfo()
+            liveActivity.start(state: activityState())
             return
         }
 
@@ -172,6 +188,7 @@ final class StemMixerEngine {
         isPlaying = true
         startDisplayTimer()
         updateNowPlayingInfo()
+        liveActivity.start(state: activityState())
     }
 
     func pause() {
@@ -182,6 +199,7 @@ final class StemMixerEngine {
         isPlaying = false
         stopDisplayTimer()
         updateNowPlayingInfo()
+        liveActivity.update(state: activityState())
     }
 
     func togglePlayPause() {
@@ -232,6 +250,27 @@ final class StemMixerEngine {
             }
             player.volume = audible ? stem.volume : 0
         }
+        liveActivity.update(state: activityState())
+    }
+
+    /// Pali/gasi kanal sa Live Activity kartice. Ako je solo aktivan, prvo se
+    /// trenutna čujnost „zamrzne" u mute flagove pa se solo ugasi — da dugmići
+    /// na kartici uvek rade predvidljivo (šta vidiš, to i čuješ).
+    func toggleStem(at index: Int) {
+        let kinds = StemKind.allCases
+        guard kinds.indices.contains(index), let target = stems[kinds[index]] else {
+            Logger(subsystem: "com.tarmi.Mazut", category: "intent")
+                .warning("toggleStem: kanal \(index) ne postoji ili nije učitan")
+            return
+        }
+        if stems.values.contains(where: { $0.isSolo }) {
+            for stem in stems.values {
+                stem.isMuted = !stem.isSolo
+                stem.isSolo = false
+            }
+        }
+        target.isMuted.toggle()
+        applyMixToAllTracks()
     }
 
     // MARK: - Pomocno
@@ -315,6 +354,20 @@ final class StemMixerEngine {
             #endif
         }
         updateNowPlayingInfo()
+        liveActivity.update(state: activityState())
+    }
+
+    /// Trenutno stanje za Live Activity karticu: čujnost svakog kanala
+    /// (mute/solo logika kao u `applyMixToAllTracks`), da li svira i naslov.
+    private func activityState() -> StemActivityAttributes.ContentState {
+        let soloActive = stems.values.contains { $0.isSolo }
+        let audible = StemKind.allCases.map { kind -> Bool in
+            guard let stem = stems[kind], tracks[kind]?.file != nil else { return false }
+            return soloActive ? stem.isSolo : !stem.isMuted
+        }
+        return .init(audible: audible,
+                     isPlaying: isPlaying,
+                     title: npTitle.isEmpty ? "Mazut" : npTitle)
     }
 
     /// Osveži stanje na zaključanom ekranu (naslov, trajanje, pozicija, da li svira).

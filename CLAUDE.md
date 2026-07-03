@@ -65,8 +65,14 @@ order:   drums, bass, other, vocals, guitar, piano   (== DemucsSeparator.modelOr
    `<Application Support>/MazutStems/<hash>/`. Same song (any name/path) is separated only
    once. Stems stored as AAC `.m4a` (falls back to `.wav` for older caches).
 4. `StemMixerEngine` — `AVAudioEngine` graph, one `AVAudioPlayerNode` per stem, synchronized
-   transport (play/pause/seek) with per-stem volume/mute/solo.
+   transport (play/pause/seek) with per-stem volume/mute/solo. **Singleton** (`.shared`);
+   also owns background playback: Now Playing info + remote commands (lock screen), audio
+   session interruptions, and the Live Activity lifecycle.
 5. `ContentView` — single SwiftUI view: library list, file importer, transport, stem mixer.
+6. `MazutWidget/` — widget extension (`MazutWidgetExtension` target) with the lock-screen
+   Live Activity: per-stem on/off buttons via `ToggleStemIntent` (an `AudioPlaybackIntent`,
+   so it runs in the app process). `StemActivityShared.swift` compiles into **both** targets
+   (sync-group membership exception in the pbxproj).
 
 ### Known traps (do not regress)
 - **Core ML output strides**: `time_out` is channel-stride-padded (343984, not 343980) for
@@ -84,6 +90,18 @@ order:   drums, bass, other, vocals, guitar, piano   (== DemucsSeparator.modelOr
 - **`spec_out` is read strided in ISTFT** (`re[k*T+t]`, stride T). `consume()` copies it to a
   contiguous CPU buffer once (sequential memcpy) before ISTFT — keep that; it avoids strided
   access into GPU-backed Core ML output memory.
+- **`StemMixerEngine` must stay a singleton.** Its `init()` binds global bridges (remote
+  commands, interruption observers, `StemToggleBox.onToggle` for the Live Activity buttons).
+  SwiftUI re-runs the `ContentView` initializer (e.g. on lock/background), so a plain
+  `@State … = StemMixerEngine()` creates throwaway instances that re-point the bridges at an
+  empty engine — lock-screen buttons then silently do nothing.
+- **`UIBackgroundModes`/`NSSupportsLiveActivities` live in the partial `Mazut/Info.plist`**,
+  merged with the generated plist. `INFOPLIST_KEY_UIBackgroundModes` as a build setting is
+  silently ignored by Xcode — don't "simplify" back to it. Both Info.plist files are excluded
+  from resources via `PBXFileSystemSynchronizedBuildFileExceptionSet` entries in the pbxproj.
+- **`StemChannel` in `MazutWidget/StemActivityShared.swift` must match `StemKind.allCases`
+  order** (vocals, drums, bass, guitar, piano, other) — the Live Activity encodes channel
+  state as a positional `[Bool]`.
 
 ### Performance — profile in Release ONLY
 Separation is **GPU-bound in Release**: ~720 ms/segment, ~22 s for a 3.5-min song
