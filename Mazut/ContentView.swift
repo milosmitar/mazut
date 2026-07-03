@@ -75,6 +75,8 @@ struct ContentView: View {
             library = StemCache.library()
             playlists = PlaylistStore.load()
             engine.onPlaybackFinished = { playNext() }
+            engine.onRemoteNext = { playNextManual() }
+            engine.onRemotePrevious = { playPrevious() }
         }
         // Jedan jedini .fileImporter: dva na istom view-u se u SwiftUI-ju
         // poništavaju (radi samo poslednji). Režim biramo preko importSongMode.
@@ -728,6 +730,8 @@ struct ContentView: View {
             try engine.load(stems: stems)
             nowPlayingTitle = song.name
             nowPlayingID = song.id
+            engine.setNowPlaying(title: song.title, artist: song.artist,
+                                 artworkURL: song.artworkURL)
             if autoPlay { engine.play() }
         } catch {
             loadError = error.localizedDescription
@@ -905,6 +909,7 @@ struct ContentView: View {
                 try engine.load(stems: stems)
                 nowPlayingTitle = nil   // skup zasebnih stemova → ostaje „Mazut"
                 nowPlayingID = nil
+                engine.setNowPlaying(title: "Mazut")
             } catch {
                 loadError = error.localizedDescription
             }
@@ -928,6 +933,12 @@ struct ContentView: View {
                 // Ključ pesme = ime foldera u kome su stemovi (hash sadržaja).
                 nowPlayingID = map.values.first?.deletingLastPathComponent().lastPathComponent
                 library = StemCache.library()   // nova pesma je sad u kešu
+                if let cached = library.first(where: { $0.id == nowPlayingID }) {
+                    engine.setNowPlaying(title: cached.title, artist: cached.artist,
+                                         artworkURL: cached.artworkURL)
+                } else {
+                    engine.setNowPlaying(title: nowPlayingTitle ?? "Mazut")
+                }
             } catch is CancellationError {
                 // Korisnik je odustao — bez greške, samo se vrati na izbor pesme.
             } catch {

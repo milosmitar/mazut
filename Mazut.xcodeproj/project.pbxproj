@@ -10,9 +10,22 @@
 		459D6F4D2FEA9E82006B822B /* Mazut.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Mazut.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		459D6FEE2FEAAAAA006B822B /* Exceptions for "Mazut" folder in "Mazut" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 459D6F4C2FEA9E82006B822B /* Mazut */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		459D6F4F2FEA9E82006B822B /* Mazut */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				459D6FEE2FEAAAAA006B822B /* Exceptions for "Mazut" folder in "Mazut" target */,
+			);
 			path = Mazut;
 			sourceTree = "<group>";
 		};
@@ -254,6 +267,7 @@
 				DEVELOPMENT_TEAM = J94E9N656K;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Mazut/Info.plist;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Mikrofon se koristi za štimovanje gitare.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -287,6 +301,7 @@
 				DEVELOPMENT_TEAM = J94E9N656K;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Mazut/Info.plist;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Mikrofon se koristi za štimovanje gitare.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;

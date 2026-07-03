@@ -8,7 +8,13 @@
 //
 
 import AVFoundation
+import MediaPlayer
 import Observation
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 @Observable
 final class StemMixerEngine {
@@ -25,6 +31,10 @@ final class StemMixerEngine {
     /// Pozove se (na glavnoj niti) kada pesma stigne prirodno do kraja —
     /// koristi se za automatski prelazak na sledeću pesmu.
     var onPlaybackFinished: (() -> Void)?
+
+    /// Komande „sledeća" / „prethodna" sa zaključanog ekrana ili slušalica.
+    var onRemoteNext: (() -> Void)?
+    var onRemotePrevious: (() -> Void)?
 
     // MARK: - Audio graf
 
@@ -50,10 +60,19 @@ final class StemMixerEngine {
     /// Timer koji osvezava currentTime dok svira.
     private var displayTimer: Timer?
 
+    // MARK: - Zaključani ekran (Now Playing)
+
+    /// Metapodaci trenutne pesme za zaključani ekran / Control Center.
+    private var npTitle = ""
+    private var npArtist = ""
+    private var npArtwork: MPMediaItemArtwork?
+
     init() {
         for kind in StemKind.allCases {
             tracks[kind] = Track()
         }
+        setupRemoteCommands()
+        observeInterruptions()
     }
 
     // MARK: - Ucitavanje
@@ -114,6 +133,10 @@ final class StemMixerEngine {
         seekFrame = 0
         currentTime = 0
         isLoaded = false
+        npTitle = ""
+        npArtist = ""
+        npArtwork = nil
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
 
     // MARK: - Transport
@@ -137,6 +160,7 @@ final class StemMixerEngine {
             activePlayers().forEach { $0.play() }
             isPlaying = true
             startDisplayTimer()
+            updateNowPlayingInfo()
             return
         }
 
@@ -147,6 +171,7 @@ final class StemMixerEngine {
         }
         isPlaying = true
         startDisplayTimer()
+        updateNowPlayingInfo()
     }
 
     func pause() {
@@ -156,6 +181,7 @@ final class StemMixerEngine {
         activePlayers().forEach { $0.stop() }
         isPlaying = false
         stopDisplayTimer()
+        updateNowPlayingInfo()
     }
 
     func togglePlayPause() {
@@ -187,6 +213,7 @@ final class StemMixerEngine {
             let startTime = AVAudioTime(sampleTime: startSample, atRate: sampleRate)
             activePlayers().forEach { $0.play(at: startTime) }
         }
+        updateNowPlayingInfo()
     }
 
     // MARK: - Mix kontrola (volume / mute / solo)
@@ -265,6 +292,115 @@ final class StemMixerEngine {
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .default)
         try? session.setActive(true)
+        #endif
+    }
+
+    // MARK: - Zaključani ekran / Control Center
+
+    /// Postavi metapodatke pesme koji se prikazuju na zaključanom ekranu.
+    /// Pozvati posle `load(stems:)`; prazan naslov briše prikaz.
+    func setNowPlaying(title: String, artist: String = "", artworkURL: URL? = nil) {
+        npTitle = title
+        npArtist = artist
+        npArtwork = nil
+        if let url = artworkURL {
+            #if canImport(UIKit)
+            if let img = UIImage(contentsOfFile: url.path) {
+                npArtwork = MPMediaItemArtwork(boundsSize: img.size) { _ in img }
+            }
+            #elseif canImport(AppKit)
+            if let img = NSImage(contentsOfFile: url.path) {
+                npArtwork = MPMediaItemArtwork(boundsSize: img.size) { _ in img }
+            }
+            #endif
+        }
+        updateNowPlayingInfo()
+    }
+
+    /// Osveži stanje na zaključanom ekranu (naslov, trajanje, pozicija, da li svira).
+    /// Sistem sam ekstrapolira poziciju preko `rate`, pa je dovoljno zvati ovo
+    /// na play/pause/seek, ne na svaki otkucaj tajmera.
+    private func updateNowPlayingInfo() {
+        guard isLoaded, !npTitle.isEmpty else { return }
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: npTitle,
+            MPMediaItemPropertyPlaybackDuration: duration,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: min(Double(currentFrame()) / sampleRate, duration),
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
+        ]
+        if !npArtist.isEmpty { info[MPMediaItemPropertyArtist] = npArtist }
+        if let art = npArtwork { info[MPMediaItemPropertyArtwork] = art }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    /// Registruj komande sa zaključanog ekrana / slušalica. Handleri mogu stići
+    /// van glavne niti, pa se rad prebacuje na main.
+    private func setupRemoteCommands() {
+        let center = MPRemoteCommandCenter.shared()
+
+        center.playCommand.addTarget { [weak self] _ in
+            DispatchQueue.main.async { self?.play() }
+            return .success
+        }
+        center.pauseCommand.addTarget { [weak self] _ in
+            DispatchQueue.main.async { self?.pause() }
+            return .success
+        }
+        center.togglePlayPauseCommand.addTarget { [weak self] _ in
+            DispatchQueue.main.async { self?.togglePlayPause() }
+            return .success
+        }
+        center.nextTrackCommand.addTarget { [weak self] _ in
+            DispatchQueue.main.async { self?.onRemoteNext?() }
+            return .success
+        }
+        center.previousTrackCommand.addTarget { [weak self] _ in
+            DispatchQueue.main.async { self?.onRemotePrevious?() }
+            return .success
+        }
+        center.changePlaybackPositionCommand.addTarget { [weak self] event in
+            guard let e = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
+            let time = e.positionTime
+            DispatchQueue.main.async { self?.seek(to: time) }
+            return .success
+        }
+    }
+
+    /// Prekidi audio sesije (telefonski poziv, Siri…) i izvučene slušalice.
+    private func observeInterruptions() {
+        #if os(iOS)
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            switch type {
+            case .began:
+                self.pause()
+            case .ended:
+                // Nastavi samo ako sistem kaže da treba (npr. kraj poziva).
+                let opts = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+                if AVAudioSession.InterruptionOptions(rawValue: opts).contains(.shouldResume) {
+                    self.play()
+                }
+            @unknown default:
+                break
+            }
+        }
+        // Izvučene slušalice / prekinut Bluetooth → pauza (standardno ponašanje).
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] note in
+            guard let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                  AVAudioSession.RouteChangeReason(rawValue: raw) == .oldDeviceUnavailable
+            else { return }
+            self?.pause()
+        }
         #endif
     }
 }
