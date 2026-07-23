@@ -65,6 +65,10 @@ struct ContentView: View {
     @State private var playbackDelay = 0
     /// Task koji čeka pauzu pa pušta sledeću pesmu (otkazuje se pri ručnoj akciji).
     @State private var delayTask: Task<Void, Never>?
+    /// Ponavljanje trenutne pesme (nezavisno od reda/plejliste).
+    @State private var repeatEnabled = false
+    /// Nasumičan izbor sledeće pesme iz reda, umesto sledeće po redosledu.
+    @State private var shuffleEnabled = false
 
     var body: some View {
         Group {
@@ -741,15 +745,19 @@ struct ContentView: View {
         }
     }
 
-    /// Pređi na sledeću pesmu u redu i pusti je — samo ako je auto-prelazak uključen
-    /// (tj. reprodukcija je krenula iz plejliste). Na kraju reda se zaustavlja.
+    /// Pređi na sledeću pesmu (kraj pesme, prirodan završetak). Ako je uključeno
+    /// ponavljanje, samo vrti istu pesmu ispočetka; u suprotnom bira sledeću —
+    /// nasumičnu (shuffle) ili po redosledu, ali samo ako je auto-prelazak uključen
+    /// (tj. reprodukcija je krenula iz plejliste) — shuffle to zahtevanje zaobilazi.
     private func playNext() {
-        guard autoAdvance,
-              let idx = currentQueueIndex,
-              idx + 1 < playQueue.count else { return }
-        let next = playQueue[idx + 1]
+        if repeatEnabled {
+            engine.seek(to: 0)
+            engine.play()
+            return
+        }
+        guard let next = nextSongForAdvance() else { return }
         guard playbackDelay > 0 else {
-            openCached(next, queue: playQueue, autoAdvance: true, autoPlay: true)
+            openCached(next, queue: playQueue, autoAdvance: autoAdvance, autoPlay: true)
             return
         }
         // Pauza između pesama, pa pusti sledeću (osim ako korisnik prekine).
@@ -757,8 +765,24 @@ struct ContentView: View {
         delayTask = Task {
             try? await Task.sleep(for: .seconds(playbackDelay))
             guard !Task.isCancelled else { return }
-            openCached(next, queue: playQueue, autoAdvance: true, autoPlay: true)
+            openCached(next, queue: playQueue, autoAdvance: autoAdvance, autoPlay: true)
         }
+    }
+
+    /// Sledeća pesma za auto-prelazak na kraju pesme: nasumična (shuffle, uvek
+    /// dostupna) ili sledeća po redu (samo kad je auto-prelazak uključen).
+    private func nextSongForAdvance() -> CachedSong? {
+        guard let idx = currentQueueIndex else { return nil }
+        if shuffleEnabled { return randomOtherSong(excluding: idx) }
+        guard autoAdvance, idx + 1 < playQueue.count else { return nil }
+        return playQueue[idx + 1]
+    }
+
+    /// Nasumična pesma iz reda, različita od one na indeksu `idx` (ako ih ima više).
+    private func randomOtherSong(excluding idx: Int) -> CachedSong? {
+        let candidates = playQueue.indices.filter { $0 != idx }
+        guard let j = candidates.randomElement() else { return nil }
+        return playQueue[j]
     }
 
     /// Pozicija trenutne pesme u redu reprodukcije.
@@ -768,8 +792,9 @@ struct ContentView: View {
     }
 
     private var canGoNext: Bool {
-        if let i = currentQueueIndex { return i + 1 < playQueue.count }
-        return false
+        guard let i = currentQueueIndex else { return false }
+        if shuffleEnabled { return playQueue.count > 1 }
+        return i + 1 < playQueue.count
     }
 
     /// Ručno (dugme „prethodna"): prvi pritisak vraća na početak pesme; ako je
@@ -786,9 +811,16 @@ struct ContentView: View {
         openCached(playQueue[i - 1], queue: playQueue, autoAdvance: autoAdvance, autoPlay: true)
     }
 
-    /// Ručno (dugme) — sledeća pesma u redu; zadržava trenutni način prelaska.
+    /// Ručno (dugme) — sledeća pesma u redu (nasumična ako je shuffle uključen,
+    /// inače po redosledu); zadržava trenutni način prelaska.
     private func playNextManual() {
-        guard let i = currentQueueIndex, i + 1 < playQueue.count else { return }
+        guard let i = currentQueueIndex else { return }
+        if shuffleEnabled {
+            guard let next = randomOtherSong(excluding: i) else { return }
+            openCached(next, queue: playQueue, autoAdvance: autoAdvance, autoPlay: true)
+            return
+        }
+        guard i + 1 < playQueue.count else { return }
         openCached(playQueue[i + 1], queue: playQueue, autoAdvance: autoAdvance, autoPlay: true)
     }
 
@@ -812,7 +844,16 @@ struct ContentView: View {
             .font(.caption.monospacedDigit())
             .foregroundStyle(.secondary)
 
-            HStack(spacing: 40) {
+            HStack(spacing: 24) {
+                Button {
+                    shuffleEnabled.toggle()
+                } label: {
+                    Image(systemName: "shuffle")
+                        .font(.system(size: 18))
+                        .foregroundStyle(shuffleEnabled ? Color.accentColor : .secondary)
+                }
+                .buttonStyle(.plain)
+
                 Button {
                     playPrevious()
                 } label: {
@@ -834,6 +875,15 @@ struct ContentView: View {
                         .font(.system(size: 28))
                 }
                 .disabled(!canGoNext)
+
+                Button {
+                    repeatEnabled.toggle()
+                } label: {
+                    Image(systemName: "repeat")
+                        .font(.system(size: 18))
+                        .foregroundStyle(repeatEnabled ? Color.accentColor : .secondary)
+                }
+                .buttonStyle(.plain)
             }
 
             metronomeBar
