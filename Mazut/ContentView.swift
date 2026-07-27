@@ -38,8 +38,6 @@ struct ContentView: View {
     @State private var tuner = Tuner()
     @State private var stems: [Stem] = StemKind.allCases.map { Stem(kind: $0) }
     @State private var showImporter = false
-    /// true = „Razdvoj pesmu" (jedan fajl → separacija), false = „Učitaj gotove stemove" (više fajlova).
-    @State private var importSongMode = false
     @State private var loadError: String?
     @State private var separationTask: Task<Void, Never>?
     @State private var library: [CachedSong] = []
@@ -85,21 +83,15 @@ struct ContentView: View {
             engine.onRemoteNext = { playNextManual() }
             engine.onRemotePrevious = { playPrevious() }
         }
-        // Jedan jedini .fileImporter: dva na istom view-u se u SwiftUI-ju
-        // poništavaju (radi samo poslednji). Režim biramo preko importSongMode.
         .fileImporter(
             isPresented: $showImporter,
             allowedContentTypes: [.audio],
-            allowsMultipleSelection: !importSongMode
+            allowsMultipleSelection: false
         ) { result in
-            if importSongMode {
-                if case .success(let urls) = result, let url = urls.first {
-                    separateSong(url)
-                } else if case .failure(let error) = result {
-                    loadError = error.localizedDescription
-                }
-            } else {
-                handleImport(result)
+            if case .success(let urls) = result, let url = urls.first {
+                separateSong(url)
+            } else if case .failure(let error) = result {
+                loadError = error.localizedDescription
             }
         }
         .alert("Greška", isPresented: .constant(loadError != nil)) {
@@ -126,9 +118,9 @@ struct ContentView: View {
             metronomeTab
                 .tabItem { Label("Metronom", systemImage: "metronome") }
                 .tag(2)
-            tunerTab
-                .tabItem { Label("Štimer", systemImage: "tuningfork") }
-                .tag(3)
+            // tunerTab
+            //     .tabItem { Label("Štimer", systemImage: "tuningfork") }
+            //     .tag(3)
         }
         .onChange(of: selectedTab) { _, newValue in
             // Štimer snima samo dok je njegov tab otvoren.
@@ -202,20 +194,13 @@ struct ContentView: View {
         }
     }
 
-    /// Meni „Dodaj novu" (razdvoj / učitaj stemove / preuzmi).
+    /// Meni „Dodaj novu" (razdvoj / preuzmi).
     private var addNewMenu: some View {
         Menu {
             Button {
-                importSongMode = true
                 showImporter = true
             } label: {
                 Label("Razdvoj pesmu", systemImage: "wand.and.stars")
-            }
-            Button {
-                importSongMode = false
-                showImporter = true
-            } label: {
-                Label("Učitaj gotove stemove", systemImage: "folder")
             }
             Button {
                 openURL(downloadURL)
@@ -650,15 +635,14 @@ struct ContentView: View {
             Image(systemName: "waveform.badge.plus")
                 .font(.system(size: 56))
                 .foregroundStyle(.secondary)
-            Text("Učitaj stemove")
+            Text("Razdvoj pesmu")
                 .font(.title2.bold())
-            Text("Izaberi do 6 audio fajlova. Dodeljuju se redom: vokal, bubnjevi, bas, gitara, klavir, ostalo.")
+            Text("Izaberi audio fajl. Automatski se razdvaja na 6 stemova: vokal, bubnjevi, bas, gitara, klavir, ostalo.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 40)
             Button {
-                importSongMode = true
                 showImporter = true
             } label: {
                 Label("Razdvoj pesmu", systemImage: "wand.and.stars")
@@ -666,14 +650,6 @@ struct ContentView: View {
             }
             .buttonStyle(.borderedProminent)
             .padding(.top, 8)
-
-            Button {
-                importSongMode = false
-                showImporter = true
-            } label: {
-                Label("Učitaj gotove stemove", systemImage: "folder")
-                    .font(.subheadline)
-            }
 
             Button {
                 openURL(downloadURL)
@@ -945,31 +921,6 @@ struct ContentView: View {
     }
 
     // MARK: - Import
-
-    private func handleImport(_ result: Result<[URL], Error>) {
-        switch result {
-        case .success(let urls):
-            // Kopiraj fajlove lokalno (izbegava security-scope probleme) i dodeli redom.
-            let assigned: [Stem] = StemKind.allCases.map { Stem(kind: $0) }
-            for (index, url) in urls.prefix(StemKind.allCases.count).enumerated() {
-                guard let local = copyToTemp(url) else { continue }
-                assigned[index].url = local
-            }
-            stems = assigned
-            playQueue = []
-            autoAdvance = false
-            do {
-                try engine.load(stems: stems)
-                nowPlayingTitle = nil   // skup zasebnih stemova → ostaje „Mazut"
-                nowPlayingID = nil
-                engine.setNowPlaying(title: "Mazut")
-            } catch {
-                loadError = error.localizedDescription
-            }
-        case .failure(let error):
-            loadError = error.localizedDescription
-        }
-    }
 
     private func separateSong(_ url: URL) {
         guard let local = copyToTemp(url) else { loadError = "Ne mogu da učitam fajl."; return }
