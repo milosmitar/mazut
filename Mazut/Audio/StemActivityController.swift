@@ -2,9 +2,9 @@
 //  StemActivityController.swift
 //  Mazut
 //
-//  Upravljanje Live Activity karticom na zaključanom ekranu (naslov pesme +
-//  dugmići za kanale). Sama kartica (UI) živi u MazutWidget ekstenziji;
-//  zajednički model je u MazutWidget/StemActivityShared.swift.
+//  Manages the Live Activity card on the lock screen (song title +
+//  per-channel buttons). The card itself (UI) lives in the MazutWidget
+//  extension; the shared model is in MazutWidget/StemActivityShared.swift.
 //
 
 #if canImport(ActivityKit)
@@ -16,13 +16,13 @@ final class StemActivityController {
     private var activity: Activity<StemActivityAttributes>?
 
     init() {
-        // Pokupi i ugasi zaostale kartice od prethodnog pokretanja aplikacije.
-        for stara in Activity<StemActivityAttributes>.activities {
-            Task { await stara.end(nil, dismissalPolicy: .immediate) }
+        // Pick up and end any leftover cards from a previous app launch.
+        for old in Activity<StemActivityAttributes>.activities {
+            Task { await old.end(nil, dismissalPolicy: .immediate) }
         }
     }
 
-    /// Prikaži karticu (ili osveži postojeću). Poziva se kad krene reprodukcija.
+    /// Show the card (or refresh the existing one). Called when playback starts.
     func start(state: StemActivityAttributes.ContentState) {
         guard activity == nil else {
             update(state: state)
@@ -40,7 +40,7 @@ final class StemActivityController {
         Task { await activity.update(ActivityContent(state: state, staleDate: nil)) }
     }
 
-    /// Skloni karticu sa zaključanog ekrana (kad se izađe iz plejera).
+    /// Remove the card from the lock screen (when leaving the player).
     func end() {
         guard let activity else { return }
         self.activity = nil
@@ -50,7 +50,7 @@ final class StemActivityController {
 
 #else
 
-/// macOS i ostale platforme nemaju ActivityKit — prazna implementacija.
+/// macOS and other platforms don't have ActivityKit — empty implementation.
 @MainActor
 final class StemActivityController {
     func start(state: StemActivityAttributes.ContentState) {}

@@ -2,8 +2,8 @@
 //  StemMixerEngine.swift
 //  Mazut
 //
-//  AVAudioEngine graf koji svira vise stemova sinhronizovano, sa zasebnom
-//  kontrolom jacine / mute / solo po stemu i zajednickim transportom
+//  AVAudioEngine graph that plays multiple stems in sync, with independent
+//  volume / mute / solo control per stem and a shared transport
 //  (play / pause / seek).
 //
 
@@ -20,61 +20,61 @@ import AppKit
 @Observable
 final class StemMixerEngine {
 
-    /// Jedina instanca. Engine u `init()` vezuje globalne mostove (remote
-    /// komande, prekidi sesije, StemToggleBox za Live Activity) — sme da
-    /// postoji samo jedan, inače poslednja konstruisana (prazna) instanca
-    /// pregazi mostove i dugmići sa zaključanog ekrana rade u prazno.
+    /// The single instance. The engine's `init()` binds global bridges (remote
+    /// commands, session interruptions, StemToggleBox for the Live Activity) —
+    /// only one may exist, otherwise the last-constructed (empty) instance
+    /// overwrites the bridges and the lock-screen buttons do nothing.
     static let shared = StemMixerEngine()
 
-    // MARK: - Javno stanje (UI ga posmatra)
+    // MARK: - Public state (observed by the UI)
 
     private(set) var isPlaying = false
-    /// Trajanje najduzeg ucitanog stema, u sekundama.
+    /// Duration of the longest loaded stem, in seconds.
     private(set) var duration: TimeInterval = 0
-    /// Trenutna pozicija reprodukcije u sekundama.
+    /// Current playback position in seconds.
     var currentTime: TimeInterval = 0
     private(set) var isLoaded = false
 
-    /// Pozove se (na glavnoj niti) kada pesma stigne prirodno do kraja —
-    /// koristi se za automatski prelazak na sledeću pesmu.
+    /// Called (on the main thread) when a song reaches its natural end —
+    /// used to auto-advance to the next song.
     var onPlaybackFinished: (() -> Void)?
 
-    /// Komande „sledeća" / „prethodna" sa zaključanog ekrana ili slušalica.
+    /// "Next" / "previous" commands from the lock screen or headphones.
     var onRemoteNext: (() -> Void)?
     var onRemotePrevious: (() -> Void)?
 
-    // MARK: - Audio graf
+    // MARK: - Audio graph
 
     private let engine = AVAudioEngine()
 
-    /// Po jedan player node + audio fajl za svaki StemKind.
+    /// One player node + audio file per StemKind.
     private struct Track {
         let player = AVAudioPlayerNode()
         var file: AVAudioFile?
     }
     private var tracks: [StemKind: Track] = [:]
 
-    /// Referenca na Stem modele kako bi engine citao volume/mute/solo.
+    /// Reference to the Stem models so the engine can read volume/mute/solo.
     private var stems: [StemKind: Stem] = [:]
 
-    /// Frame sa kog krece reprodukcija (za seek / resume).
+    /// Frame at which playback starts (for seek / resume).
     private var seekFrame: AVAudioFramePosition = 0
-    /// Sample rate referentnog fajla.
+    /// Sample rate of the reference file.
     private var sampleRate: Double = 44_100
-    /// Ukupan broj frejmova najduzeg stema.
+    /// Total frame count of the longest stem.
     private var totalFrames: AVAudioFramePosition = 0
 
-    /// Timer koji osvezava currentTime dok svira.
+    /// Timer that refreshes currentTime while playing.
     private var displayTimer: Timer?
 
-    // MARK: - Zaključani ekran (Now Playing)
+    // MARK: - Lock screen (Now Playing)
 
-    /// Metapodaci trenutne pesme za zaključani ekran / Control Center.
+    /// Metadata of the current song shown on the lock screen / Control Center.
     private var npTitle = ""
     private var npArtist = ""
     private var npArtwork: MPMediaItemArtwork?
 
-    /// Live Activity kartica sa dugmićima za kanale na zaključanom ekranu.
+    /// Live Activity card with per-channel buttons on the lock screen.
     private let liveActivity = StemActivityController()
 
     private init() {
@@ -83,19 +83,19 @@ final class StemMixerEngine {
         }
         setupRemoteCommands()
         observeInterruptions()
-        // Dugme na Live Activity kartici → pali/gasi kanal.
+        // Button on the Live Activity card → toggles a channel on/off.
         StemToggleBox.shared.onToggle = { [weak self] index in
             self?.toggleStem(at: index)
         }
     }
 
-    // MARK: - Ucitavanje
+    // MARK: - Loading
 
-    /// Ucitava stemove i pravi audio graf. `stems` su modeli iz UI-ja.
+    /// Loads the stems and builds the audio graph. `stems` are the models from the UI.
     func load(stems: [Stem]) throws {
         stop()
         engine.stop()
-        // Skini sve stare nodove sa grafa.
+        // Remove all old nodes from the graph.
         for (_, track) in tracks {
             if track.player.engine != nil { engine.detach(track.player) }
         }
@@ -133,7 +133,7 @@ final class StemMixerEngine {
         applyMixToAllTracks()
     }
 
-    /// Oslobodi sve stemove i vrati engine u prazno stanje (UI → izbor pesme).
+    /// Release all stems and return the engine to an empty state (UI → song selection).
     func unload() {
         stop()
         engine.stop()
@@ -168,7 +168,7 @@ final class StemMixerEngine {
 
         scheduleFromSeekFrame()
 
-        // Sinhronizovan start: svi nodovi krecu na isti buduci sample time.
+        // Synchronized start: all nodes begin at the same future sample time.
         guard let anyPlayer = activePlayers().first,
               let renderTime = anyPlayer.lastRenderTime ?? engine.outputNode.lastRenderTime
         else {
@@ -193,7 +193,7 @@ final class StemMixerEngine {
 
     func pause() {
         guard isPlaying else { return }
-        // Zapamti gde smo stali pre nego sto zaustavimo nodove.
+        // Remember where we stopped before halting the nodes.
         seekFrame = currentFrame()
         activePlayers().forEach { $0.stop() }
         isPlaying = false
@@ -215,7 +215,7 @@ final class StemMixerEngine {
         stopDisplayTimer()
     }
 
-    /// Premotavanje na zadato vreme u sekundama.
+    /// Seek to the given time in seconds.
     func seek(to time: TimeInterval) {
         let clamped = max(0, min(time, duration))
         let wasPlaying = isPlaying
@@ -234,10 +234,10 @@ final class StemMixerEngine {
         updateNowPlayingInfo()
     }
 
-    // MARK: - Mix kontrola (volume / mute / solo)
+    // MARK: - Mix control (volume / mute / solo)
 
-    /// Primeni jacinu i mute/solo logiku na sve player nodove.
-    /// Pozvati svaki put kad korisnik promeni slider ili dugme.
+    /// Apply volume and mute/solo logic to all player nodes.
+    /// Call every time the user changes a slider or button.
     func applyMixToAllTracks() {
         let soloActive = stems.values.contains { $0.isSolo }
         for (kind, stem) in stems {
@@ -253,14 +253,15 @@ final class StemMixerEngine {
         liveActivity.update(state: activityState())
     }
 
-    /// Pali/gasi kanal sa Live Activity kartice. Ako je solo aktivan, prvo se
-    /// trenutna čujnost „zamrzne" u mute flagove pa se solo ugasi — da dugmići
-    /// na kartici uvek rade predvidljivo (šta vidiš, to i čuješ).
+    /// Toggle a channel from the Live Activity card. If solo is active, the
+    /// current audibility is first "frozen" into the mute flags and solo is
+    /// turned off — so the card's buttons always behave predictably (what you
+    /// see is what you hear).
     func toggleStem(at index: Int) {
         let kinds = StemKind.allCases
         guard kinds.indices.contains(index), let target = stems[kinds[index]] else {
             Logger(subsystem: "com.tarmi.Mazut", category: "intent")
-                .warning("toggleStem: kanal \(index) ne postoji ili nije učitan")
+                .warning("toggleStem: channel \(index) doesn't exist or isn't loaded")
             return
         }
         if stems.values.contains(where: { $0.isSolo }) {
@@ -273,15 +274,15 @@ final class StemMixerEngine {
         applyMixToAllTracks()
     }
 
-    // MARK: - Pomocno
+    // MARK: - Helpers
 
     private func activePlayers() -> [AVAudioPlayerNode] {
         tracks.values.filter { $0.file != nil }.map { $0.player }
     }
 
-    /// Zakazi reprodukciju svih fajlova od seekFrame do kraja.
+    /// Schedule playback of all files from seekFrame to the end.
     private func scheduleFromSeekFrame() {
-        // Odbrana: startingFrame mora biti u [0, file.length].
+        // Guard: startingFrame must be within [0, file.length].
         let start = max(0, seekFrame)
         for (_, track) in tracks {
             guard let file = track.file else { continue }
@@ -294,14 +295,14 @@ final class StemMixerEngine {
         }
     }
 
-    /// Trenutni frame na osnovu pozicije player node-a.
+    /// Current frame based on the player node's position.
     private func currentFrame() -> AVAudioFramePosition {
         guard let player = activePlayers().first,
               let nodeTime = player.lastRenderTime,
               let playerTime = player.playerTime(forNodeTime: nodeTime)
         else { return seekFrame }
-        // Pre nego sto zakazani `play(at:)` start stigne, sampleTime je negativan;
-        // ne dozvoli da pozicija (a samim tim i seekFrame) padne ispod nule.
+        // Before a scheduled `play(at:)` start arrives, sampleTime is negative;
+        // don't let the position (and thus seekFrame) drop below zero.
         return max(0, seekFrame + playerTime.sampleTime)
     }
 
@@ -311,7 +312,7 @@ final class StemMixerEngine {
             guard let self else { return }
             let frame = self.currentFrame()
             self.currentTime = min(Double(frame) / self.sampleRate, self.duration)
-            // Kraj pesme: zaustavi i javi (auto-prelazak na sledeću).
+            // End of song: stop and notify (auto-advance to the next).
             if frame >= self.totalFrames, self.totalFrames > 0 {
                 self.pause()
                 self.seekFrame = 0
@@ -334,10 +335,10 @@ final class StemMixerEngine {
         #endif
     }
 
-    // MARK: - Zaključani ekran / Control Center
+    // MARK: - Lock screen / Control Center
 
-    /// Postavi metapodatke pesme koji se prikazuju na zaključanom ekranu.
-    /// Pozvati posle `load(stems:)`; prazan naslov briše prikaz.
+    /// Set the song metadata shown on the lock screen.
+    /// Call after `load(stems:)`; an empty title clears the display.
     func setNowPlaying(title: String, artist: String = "", artworkURL: URL? = nil) {
         npTitle = title
         npArtist = artist
@@ -357,8 +358,8 @@ final class StemMixerEngine {
         liveActivity.update(state: activityState())
     }
 
-    /// Trenutno stanje za Live Activity karticu: čujnost svakog kanala
-    /// (mute/solo logika kao u `applyMixToAllTracks`), da li svira i naslov.
+    /// Current state for the Live Activity card: audibility of every channel
+    /// (mute/solo logic as in `applyMixToAllTracks`), whether it's playing, and the title.
     private func activityState() -> StemActivityAttributes.ContentState {
         let soloActive = stems.values.contains { $0.isSolo }
         let audible = StemKind.allCases.map { kind -> Bool in
@@ -370,9 +371,9 @@ final class StemMixerEngine {
                      title: npTitle.isEmpty ? "Mazut" : npTitle)
     }
 
-    /// Osveži stanje na zaključanom ekranu (naslov, trajanje, pozicija, da li svira).
-    /// Sistem sam ekstrapolira poziciju preko `rate`, pa je dovoljno zvati ovo
-    /// na play/pause/seek, ne na svaki otkucaj tajmera.
+    /// Refresh the lock-screen state (title, duration, position, playing or not).
+    /// The system extrapolates position via `rate` on its own, so it's enough to
+    /// call this on play/pause/seek, not on every timer tick.
     private func updateNowPlayingInfo() {
         guard isLoaded, !npTitle.isEmpty else { return }
         var info: [String: Any] = [
@@ -386,8 +387,8 @@ final class StemMixerEngine {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
-    /// Registruj komande sa zaključanog ekrana / slušalica. Handleri mogu stići
-    /// van glavne niti, pa se rad prebacuje na main.
+    /// Register commands from the lock screen / headphones. Handlers may arrive
+    /// off the main thread, so the work is dispatched to main.
     private func setupRemoteCommands() {
         let center = MPRemoteCommandCenter.shared()
 
@@ -419,7 +420,7 @@ final class StemMixerEngine {
         }
     }
 
-    /// Prekidi audio sesije (telefonski poziv, Siri…) i izvučene slušalice.
+    /// Audio session interruptions (phone call, Siri…) and headphones unplugged.
     private func observeInterruptions() {
         #if os(iOS)
         NotificationCenter.default.addObserver(
@@ -434,7 +435,7 @@ final class StemMixerEngine {
             case .began:
                 self.pause()
             case .ended:
-                // Nastavi samo ako sistem kaže da treba (npr. kraj poziva).
+                // Resume only if the system says to (e.g. call ended).
                 let opts = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
                 if AVAudioSession.InterruptionOptions(rawValue: opts).contains(.shouldResume) {
                     self.play()
@@ -443,7 +444,7 @@ final class StemMixerEngine {
                 break
             }
         }
-        // Izvučene slušalice / prekinut Bluetooth → pauza (standardno ponašanje).
+        // Headphones unplugged / Bluetooth dropped → pause (standard behavior).
         NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification,
             object: AVAudioSession.sharedInstance(),

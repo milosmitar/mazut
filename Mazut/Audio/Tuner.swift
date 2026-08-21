@@ -2,97 +2,98 @@
 //  Tuner.swift
 //  Mazut
 //
-//  Štimer za gitaru. Snima sa mikrofona preko sopstvenog AVAudioEngine-a i
-//  detektuje osnovnu frekvenciju (pitch) YIN algoritmom u Swiftu (Accelerate),
-//  pa je mapira na najbližu notu + odstupanje u centima. Podržava standardni i
-//  alternativne štimove (Drop D, Open G…), kao i čisto hromatski režim.
+//  Guitar tuner. Records from the microphone via its own AVAudioEngine and
+//  detects the fundamental frequency (pitch) with a YIN algorithm in Swift
+//  (Accelerate), then maps it to the nearest note + deviation in cents.
+//  Supports standard and alternative tunings (Drop D, Open G…), as well as a
+//  pure chromatic mode.
 //
-//  Monofona detekcija (jedna žica u trenutku) je mnogo lakša od separacije —
-//  YIN je tačan baš na niskim frekvencijama (niska E ~82 Hz) i otporan na
-//  harmonike, gde FFT-pristup često „pogreši oktavu".
+//  Monophonic detection (one string at a time) is much easier than separation —
+//  YIN is accurate right down to low frequencies (low E ~82 Hz) and resistant
+//  to harmonics, where an FFT-based approach often "gets the octave wrong".
 //
 
 import AVFoundation
 import Accelerate
 import Observation
 
-// MARK: - Štim
+// MARK: - Tuning
 
-/// Jedan preset štima: ime + 6 žica izraženih kao MIDI brojevi (od najniže ka
-/// najvišoj). Prazan `strings` znači hromatski režim (bez ciljnih žica).
+/// A single tuning preset: name + 6 strings expressed as MIDI numbers (lowest to
+/// highest). An empty `strings` means chromatic mode (no target strings).
 struct GuitarTuning: Identifiable, Hashable {
     let name: String
-    /// MIDI brojevi žica, niska → visoka. Prazno = hromatski.
+    /// MIDI numbers of the strings, low → high. Empty = chromatic.
     let strings: [Int]
 
     var id: String { name }
     var isChromatic: Bool { strings.isEmpty }
 
-    /// Indeks žice (0–5) najbliže datoj MIDI noti, ili nil u hromatskom režimu.
+    /// Index of the string (0–5) nearest the given MIDI note, or nil in chromatic mode.
     func nearestString(toMidi midi: Int) -> Int? {
         guard !strings.isEmpty else { return nil }
         return strings.indices.min { abs(strings[$0] - midi) < abs(strings[$1] - midi) }
     }
 
     // E2=40, A2=45, D3=50, G3=55, B3=59, E4=64
-    static let standard = GuitarTuning(name: "Standardni (E)", strings: [40, 45, 50, 55, 59, 64])
+    static let standard = GuitarTuning(name: "Standard (E)", strings: [40, 45, 50, 55, 59, 64])
     static let dropD    = GuitarTuning(name: "Drop D",         strings: [38, 45, 50, 55, 59, 64])
     static let dropC    = GuitarTuning(name: "Drop C",         strings: [36, 43, 48, 53, 57, 62])
-    static let halfStep = GuitarTuning(name: "Pola tona niže (Eb)", strings: [39, 44, 49, 54, 58, 63])
+    static let halfStep = GuitarTuning(name: "Half step down (Eb)", strings: [39, 44, 49, 54, 58, 63])
     static let openG    = GuitarTuning(name: "Open G",         strings: [38, 43, 50, 55, 59, 62])
     static let openD    = GuitarTuning(name: "Open D",         strings: [38, 45, 50, 54, 57, 62])
     static let dadgad   = GuitarTuning(name: "DADGAD",         strings: [38, 45, 50, 55, 57, 62])
-    static let chromatic = GuitarTuning(name: "Hromatski",     strings: [])
+    static let chromatic = GuitarTuning(name: "Chromatic",     strings: [])
 
     static let all: [GuitarTuning] = [
         .standard, .dropD, .dropC, .halfStep, .openG, .openD, .dadgad, .chromatic,
     ]
 }
 
-// MARK: - Štimer engine
+// MARK: - Tuner engine
 
 @Observable
 final class Tuner {
 
-    // MARK: Javno stanje (UI ga posmatra)
+    // MARK: Public state (observed by the UI)
 
     private(set) var isRunning = false
-    /// Ima li trenutno upotrebljivog (periodičnog, dovoljno glasnog) tona.
+    /// Whether there's currently a usable (periodic, loud enough) tone.
     private(set) var hasSignal = false
-    /// Detektovana frekvencija u Hz (zaglađena), 0 ako nema signala.
+    /// Detected frequency in Hz (smoothed), 0 if there's no signal.
     private(set) var frequency: Double = 0
-    /// Najbliža nota kao MIDI broj.
+    /// Nearest note as a MIDI number.
     private(set) var midiNote: Int = 0
-    /// Odstupanje od te note u centima (−50…+50; 0 = u štimu).
+    /// Deviation from that note in cents (−50…+50; 0 = in tune).
     private(set) var cents: Double = 0
-    /// Dozvola za mikrofon odbijena → UI prikazuje uputstvo.
+    /// Microphone permission denied → UI shows instructions.
     private(set) var permissionDenied = false
 
-    /// Izabran štim (UI bira; utiče samo na prikaz ciljnih žica).
+    /// Selected tuning (chosen by the UI; only affects the display of target strings).
     var tuning: GuitarTuning = .standard
 
-    /// Ime note bez oktave radi velikog prikaza, npr. "E", "A#".
+    /// Note name without octave, for the large display, e.g. "E", "A#".
     var noteName: String { Tuner.noteName(forMidi: midiNote) }
-    /// Ime note sa oktavom, npr. "E2".
+    /// Note name with octave, e.g. "E2".
     var noteNameWithOctave: String { Tuner.noteName(forMidi: midiNote, withOctave: true) }
 
-    // MARK: Audio graf
+    // MARK: Audio graph
 
     private let engine = AVAudioEngine()
-    /// Zaseban red za YIN analizu — da se DSP ne radi na audio I/O niti.
+    /// Separate queue for YIN analysis — so DSP doesn't run on the audio I/O thread.
     nonisolated private let analysisQueue = DispatchQueue(label: "com.tarmi.Mazut.tuner")
-    /// Poslednjih nekoliko frekvencija za medijansko zaglađivanje (gasi „skok oktave").
+    /// The last few frequencies for median smoothing (suppresses "octave jumps").
     private var history: [Double] = []
 
-    /// Akumulator sempla preko više tap-bafera. Tap može da isporuči kratke
-    /// bafere; za nisku E (~82 Hz) YIN-u treba bar 2 periode (~1170 sempl na
-    /// 48 kHz) u prozoru, pa skupljamo do `windowSamples` pre analize. Diramo
-    /// ga ISKLJUČIVO sa `analysisQueue` (serijski → bez trke).
+    /// Sample accumulator across multiple tap buffers. The tap can deliver short
+    /// buffers; for a low E (~82 Hz) YIN needs at least 2 periods (~1170 samples at
+    /// 48 kHz) in the window, so we collect up to `windowSamples` before analyzing.
+    /// Touched ONLY from `analysisQueue` (serial → no race).
     @ObservationIgnored nonisolated(unsafe) private var ring: [Float] = []
-    /// ~170 ms na 48 kHz — dovoljno za nisku E sa rezervom, a i dalje lagano.
+    /// ~170 ms at 48 kHz — enough for a low E with margin, and still light.
     private static let windowSamples = 8192
 
-    // MARK: Kontrola
+    // MARK: Control
 
     func toggle() { isRunning ? stop() : start() }
 
@@ -132,9 +133,9 @@ final class Tuner {
         analysisQueue.async { [weak self] in self?.ring.removeAll(keepingCapacity: true) }
         input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
             guard let self, let samples = Tuner.monoSamples(buffer) else { return }
-            // DSP van glavnog aktora; rezultat se vraća na main radi objave.
+            // DSP off the main actor; the result is bounced back to main for publishing.
             self.analysisQueue.async {
-                // Akumuliraj pa zadrži samo poslednjih `windowSamples` (klizni prozor).
+                // Accumulate, then keep only the last `windowSamples` (sliding window).
                 self.ring.append(contentsOf: samples)
                 if self.ring.count > Self.windowSamples {
                     self.ring.removeFirst(self.ring.count - Self.windowSamples)
@@ -155,7 +156,7 @@ final class Tuner {
         }
     }
 
-    /// Primeni novu (sirovu) frekvenciju: zaglađivanje + mapiranje na notu.
+    /// Apply a new (raw) frequency: smoothing + mapping to a note.
     private func apply(_ freq: Double) {
         guard freq > 0 else { hasSignal = false; return }
         history.append(freq)
@@ -168,7 +169,7 @@ final class Tuner {
         hasSignal = true
     }
 
-    // MARK: Dozvola + sesija
+    // MARK: Permission + session
 
     nonisolated static func requestMicPermission() async -> Bool {
         await withCheckedContinuation { cont in
@@ -183,18 +184,18 @@ final class Tuner {
     private func configureSession() {
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
-        // .measurement gasi obradu (AGC/EQ) → tačnija frekvencija.
+        // .measurement disables processing (AGC/EQ) → more accurate frequency.
         try? session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker])
         try? session.setActive(true)
         #endif
     }
 }
 
-// MARK: - Čista DSP/teorija (nonisolated, bez stanja)
+// MARK: - Pure DSP/theory (nonisolated, stateless)
 
 extension Tuner {
 
-    /// Spoji buffer u mono [Float] (prvi kanal je dovoljan za štimer).
+    /// Flatten the buffer to mono [Float] (the first channel is enough for the tuner).
     nonisolated static func monoSamples(_ buffer: AVAudioPCMBuffer) -> [Float]? {
         guard let ch = buffer.floatChannelData else { return nil }
         let n = Int(buffer.frameLength)
@@ -202,25 +203,25 @@ extension Tuner {
         return Array(UnsafeBufferPointer(start: ch[0], count: n))
     }
 
-    // Opseg gitare: niska E ~82 Hz, sa rezervom 60 Hz; gornja granica ~1200 Hz.
+    // Guitar range: low E ~82 Hz, with a 60 Hz margin; upper bound ~1200 Hz.
     private static let minFreq = 60.0
     private static let maxFreq = 1200.0
-    private static let rmsGate: Float = 0.01   // ispod ovog = tišina
+    private static let rmsGate: Float = 0.01   // below this = silence
 
-    /// YIN detekcija osnovne frekvencije. Vrati Hz, ili 0 ako ton nije
-    /// dovoljno periodičan/glasan.
+    /// YIN fundamental-frequency detection. Returns Hz, or 0 if the tone isn't
+    /// periodic/loud enough.
     nonisolated static func detectPitch(_ samples: [Float], sampleRate: Double) -> Double {
         let n = samples.count
         let maxTau = min(n / 2, Int(sampleRate / minFreq))
         let minTau = max(2, Int(sampleRate / maxFreq))
         guard maxTau > minTau + 1 else { return 0 }
 
-        // Kapija po jačini (RMS) — ne „lovimo" šum.
+        // Gate by loudness (RMS) — don't chase noise.
         var rms: Float = 0
         vDSP_rmsqv(samples, 1, &rms, vDSP_Length(n))
         guard rms >= rmsGate else { return 0 }
 
-        // 1) Funkcija razlike d(τ) = Σ_j (x[j] − x[j+τ])²
+        // 1) Difference function d(τ) = Σ_j (x[j] − x[j+τ])²
         var diff = [Float](repeating: 0, count: maxTau)
         var temp = [Float](repeating: 0, count: n)
         samples.withUnsafeBufferPointer { x in
@@ -235,7 +236,7 @@ extension Tuner {
             }
         }
 
-        // 2) Kumulativna srednja normalizovana razlika d'(τ)
+        // 2) Cumulative mean normalized difference d'(τ)
         var cmnd = [Float](repeating: 1, count: maxTau)
         var running: Float = 0
         for tau in 1..<maxTau {
@@ -243,7 +244,7 @@ extension Tuner {
             cmnd[tau] = running > 0 ? diff[tau] * Float(tau) / running : 1
         }
 
-        // 3) Apsolutni prag → prvi lokalni minimum ispod praga
+        // 3) Absolute threshold → first local minimum below the threshold
         let threshold: Float = 0.15
         var tau = minTau
         var found = -1
@@ -257,12 +258,12 @@ extension Tuner {
         }
         guard found > 0 else { return 0 }
 
-        // 4) Parabolička interpolacija oko minimuma → preciznija perioda
+        // 4) Parabolic interpolation around the minimum → more precise period
         let betterTau = parabolicMin(cmnd, found)
         return betterTau > 0 ? sampleRate / betterTau : 0
     }
 
-    /// Subsempl-tačan minimum parabolom kroz (τ−1, τ, τ+1).
+    /// Sub-sample-accurate minimum via a parabola through (τ−1, τ, τ+1).
     nonisolated private static func parabolicMin(_ d: [Float], _ tau: Int) -> Double {
         guard tau > 0, tau < d.count - 1 else { return Double(tau) }
         let s0 = Double(d[tau - 1]), s1 = Double(d[tau]), s2 = Double(d[tau + 1])
@@ -280,7 +281,7 @@ extension Tuner {
 
     private static let noteNames = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
-    /// Frekvencija → (najbliža MIDI nota, odstupanje u centima).
+    /// Frequency → (nearest MIDI note, deviation in cents).
     nonisolated static func midiAndCents(forFrequency f: Double) -> (midi: Int, cents: Double) {
         let exact = 69 + 12 * log2(f / 440)
         let midi = Int(exact.rounded())

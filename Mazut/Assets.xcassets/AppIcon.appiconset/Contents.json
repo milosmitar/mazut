@@ -1,6 +1,7 @@
 {
   "images" : [
     {
+      "filename" : "Generated Image August 21, 2026 - 2_34PM 1.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"
@@ -12,6 +13,7 @@
           "value" : "dark"
         }
       ],
+      "filename" : "Generated Image August 21, 2026 - 2_34PM.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"
@@ -23,6 +25,7 @@
           "value" : "tinted"
         }
       ],
+      "filename" : "Generated Image August 21, 2026 - 2_34PM 2.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"

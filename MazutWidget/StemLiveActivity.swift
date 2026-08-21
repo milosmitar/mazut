@@ -2,9 +2,9 @@
 //  StemLiveActivity.swift
 //  MazutWidget
 //
-//  Live Activity kartica na zaključanom ekranu: naslov pesme + 6 dugmića za
-//  paljenje/gašenje kanala dok pesma svira. Dugme okida ToggleStemIntent koji
-//  se izvršava u procesu aplikacije (živa je jer svira u pozadini).
+//  Live Activity card on the lock screen: song title + 6 buttons to toggle
+//  channels on/off while a song plays. The button triggers ToggleStemIntent,
+//  which executes in the app's process (it's alive because it plays in the background).
 //
 
 import ActivityKit
@@ -33,8 +33,8 @@ struct StemLiveActivity: Widget {
     }
 }
 
-/// Boje kanala — iste kao `StemKind.color` u aplikaciji.
-private func bojaKanala(_ ch: StemChannel) -> Color {
+/// Channel colors — same as `StemKind.color` in the app.
+private func channelColor(_ ch: StemChannel) -> Color {
     switch ch {
     case .vocals: return .pink
     case .drums:  return .orange
@@ -65,22 +65,22 @@ struct StemActivityView: View {
 
             HStack(spacing: 6) {
                 ForEach(StemChannel.allCases, id: \.rawValue) { ch in
-                    let upaljen = ch.rawValue < state.audible.count && state.audible[ch.rawValue]
+                    let isOn = ch.rawValue < state.audible.count && state.audible[ch.rawValue]
                     Button(intent: ToggleStemIntent(stemIndex: ch.rawValue)) {
                         VStack(spacing: 3) {
-                            Image(systemName: ch.simbol)
+                            Image(systemName: ch.systemImage)
                                 .font(.system(size: 16))
-                            Text(ch.naziv)
+                            Text(ch.displayName)
                                 .font(.system(size: 8))
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.7)
                         }
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 8)
-                        .foregroundStyle(upaljen ? Color.white : Color.secondary)
+                        .foregroundStyle(isOn ? Color.white : Color.secondary)
                         .background(
                             RoundedRectangle(cornerRadius: 10)
-                                .fill(upaljen ? bojaKanala(ch).opacity(0.85)
+                                .fill(isOn ? channelColor(ch).opacity(0.85)
                                               : Color.secondary.opacity(0.15))
                         )
                     }

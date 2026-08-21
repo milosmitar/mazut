@@ -2,9 +2,9 @@
 //  Metronome.swift
 //  Mazut
 //
-//  Jednostavan, uzorkom-tačan metronom. Koristi sopstveni AVAudioEngine i
-//  jedan player node u koji se ubacuje bafer jednog takta (klik na svaki
-//  dobar, akcenat na prvi) koji se vrti u petlji. Tako tempo ne „klizi".
+//  A simple, sample-accurate metronome. Uses its own AVAudioEngine and a
+//  single player node fed with a one-measure buffer (a click on every beat,
+//  accented on the first) that loops. This way the tempo never "drifts".
 //
 
 import AVFoundation
@@ -13,26 +13,26 @@ import Observation
 @Observable
 final class Metronome {
 
-    /// Tempo u otkucajima u minuti.
+    /// Tempo in beats per minute.
     var bpm: Int = 120 {
         didSet { if isRunning, bpm != oldValue { reschedule() } }
     }
-    /// Broj dobara u taktu (npr. 4 = 4/4).
+    /// Number of beats per measure (e.g. 4 = 4/4).
     var beatsPerMeasure: Int = 4 {
         didSet { if isRunning, beatsPerMeasure != oldValue { reschedule() } }
     }
 
     private(set) var isRunning = false
-    /// Trenutni dobar (0-baziran) — za vizuelni indikator.
+    /// Current beat (0-based) — for the visual indicator.
     private(set) var currentBeat = 0
 
-    // MARK: - Audio graf
+    // MARK: - Audio graph
 
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
     private let sampleRate: Double = 44_100
     private let format: AVAudioFormat
-    /// Dužina takta u frejmovima (za računanje trenutnog dobra).
+    /// Measure length in frames (for computing the current beat).
     private var measureFrames: AVAudioFramePosition = 0
     private var displayTimer: Timer?
 
@@ -42,7 +42,7 @@ final class Metronome {
         engine.connect(player, to: engine.mainMixerNode, format: format)
     }
 
-    // MARK: - Kontrola
+    // MARK: - Control
 
     func toggle() { isRunning ? stop() : start() }
 
@@ -71,14 +71,14 @@ final class Metronome {
         stopDisplayTimer()
     }
 
-    /// Tempo/takt promenjen dok svira — ponovo zakaži petlju.
+    /// Tempo/time signature changed while playing — reschedule the loop.
     private func reschedule() {
         player.stop()
         scheduleLoop()
         player.play()
     }
 
-    // MARK: - Bafer takta
+    // MARK: - Measure buffer
 
     private func scheduleLoop() {
         let buffer = makeMeasureBuffer()
@@ -86,20 +86,20 @@ final class Metronome {
         player.scheduleBuffer(buffer, at: nil, options: .loops, completionHandler: nil)
     }
 
-    /// Bafer jednog takta: kratak klik na početku svakog dobra; prvi dobar
-    /// je viši i glasniji (akcenat).
+    /// One-measure buffer: a short click at the start of every beat; the first
+    /// beat is higher-pitched and louder (accented).
     private func makeMeasureBuffer() -> AVAudioPCMBuffer {
         let framesPerBeat = max(1, Int(sampleRate * 60.0 / Double(bpm)))
         let total = framesPerBeat * beatsPerMeasure
         let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(total))!
         buffer.frameLength = AVAudioFrameCount(total)
         let samples = buffer.floatChannelData![0]
-        for i in 0..<total { samples[i] = 0 }   // tišina između klikova
+        for i in 0..<total { samples[i] = 0 }   // silence between clicks
 
         let clickFrames = min(framesPerBeat, Int(sampleRate * 0.03))
-        let decay = sampleRate * 0.008   // brza eksponencijalna envelopa
+        let decay = sampleRate * 0.008   // fast exponential envelope
         for beat in 0..<beatsPerMeasure {
-            // Akcenat (viši/glasniji klik) samo kad ima više dobara; 1/1 = ravan klik.
+            // Accent (higher-pitched/louder click) only when there's more than one beat; 1/1 = flat click.
             let isAccent = beatsPerMeasure > 1 && beat == 0
             let freq = isAccent ? 1_500.0 : 1_000.0
             let amp: Float = isAccent ? 0.9 : 0.55
@@ -113,7 +113,7 @@ final class Metronome {
         return buffer
     }
 
-    // MARK: - Vizuelni indikator (trenutni dobar)
+    // MARK: - Visual indicator (current beat)
 
     private func startDisplayTimer() {
         stopDisplayTimer()

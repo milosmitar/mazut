@@ -75,8 +75,8 @@
 		AA1100010000000000000002 /* MazutWidget */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				AA110001000000000000000E /* Exceptions for "MazutWidget" folder in "MazutWidgetExtension" target */,
 				AA110001000000000000000F /* Exceptions for "MazutWidget" folder in "Mazut" target */,
+				AA110001000000000000000E /* Exceptions for "MazutWidget" folder in "MazutWidgetExtension" target */,
 			);
 			path = MazutWidget;
 			sourceTree = "<group>";
@@ -376,7 +376,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Mazut/Info.plist;
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Mikrofon se koristi za štimovanje gitare.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "The microphone is used to tune the guitar.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -410,7 +410,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Mazut/Info.plist;
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Mikrofon se koristi za štimovanje gitare.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "The microphone is used to tune the guitar.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

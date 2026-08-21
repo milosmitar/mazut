@@ -2,12 +2,12 @@
 //  Stem.swift
 //  Mazut
 //
-//  Model jednog razdvojenog izvora zvuka (vokal, bas, bubnjevi, ostalo).
+//  Model of a single separated audio source (vocals, bass, drums, other).
 //
 
 import SwiftUI
 
-/// Tip stema. Redosled prati standardni izlaz Spleeter / Demucs modela (4 stema).
+/// Stem type. The order follows the standard output of the Spleeter / Demucs model (4 stems).
 nonisolated enum StemKind: String, CaseIterable, Identifiable {
     case vocals
     case drums
@@ -18,15 +18,15 @@ nonisolated enum StemKind: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    /// Naziv na srpskom za prikaz u UI-ju.
+    /// Display name shown in the UI.
     var displayName: String {
         switch self {
-        case .vocals: return "Vokal"
-        case .drums:  return "Bubnjevi"
-        case .bass:   return "Bas"
-        case .guitar: return "Gitara"
-        case .piano:  return "Klavir"
-        case .other:  return "Ostalo"
+        case .vocals: return "Vocals"
+        case .drums:  return "Drums"
+        case .bass:   return "Bass"
+        case .guitar: return "Guitar"
+        case .piano:  return "Piano"
+        case .other:  return "Other"
         }
     }
 
@@ -53,14 +53,14 @@ nonisolated enum StemKind: String, CaseIterable, Identifiable {
     }
 }
 
-/// Stanje jednog stema u mikseru — jačina, mute i solo.
+/// State of a single stem in the mixer — volume, mute and solo.
 @Observable
 final class Stem: Identifiable {
     let kind: StemKind
-    /// Audio fajl ovog stema. Nil dok separacija ne proizvede stem.
+    /// This stem's audio file. Nil until separation produces the stem.
     var url: URL?
 
-    /// Jačina 0...1 koju korisnik podešava sliderom.
+    /// Volume 0...1 adjusted by the user via the slider.
     var volume: Float = 1.0
     var isMuted: Bool = false
     var isSolo: Bool = false

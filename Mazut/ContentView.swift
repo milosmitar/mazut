@@ -11,7 +11,7 @@ import UIKit
 import AppKit
 #endif
 
-/// Učitaj sliku iz fajla u SwiftUI `Image` (cross-platform).
+/// Load an image from a file into a SwiftUI `Image` (cross-platform).
 private func loadArtwork(_ url: URL) -> Image? {
 #if canImport(UIKit)
     guard let img = UIImage(contentsOfFile: url.path) else { return nil }
@@ -24,14 +24,45 @@ private func loadArtwork(_ url: URL) -> Image? {
 #endif
 }
 
+/// Shared wallpaper behind all four tabs' root screens (Songs, Playlists,
+/// Metronome, Learning). `List`s paint their own opaque background by
+/// default, so each screen that uses one calls `.scrollContentBackground(.hidden)`
+/// so this shows through around/behind their (still-opaque) row cards.
+/// Placed inside each tab's own `NavigationStack` (not on the outer `TabView`)
+/// since `NavigationStack` content otherwise sits on an opaque system background
+/// that a `TabView`-level `.background()` can't show through.
+struct TabBackgroundView: View {
+    var body: some View {
+        GeometryReader { geo in
+            Image("TabBackground")
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: geo.size.width, height: geo.size.height)
+                .clipped()
+                .blur(radius: 6)
+                .overlay {
+                    LinearGradient(
+                        colors: [
+                            Color.black.opacity(0.55),
+                            Color.black.opacity(0.7),
+                            Color.black.opacity(0.55),
+                        ],
+                        startPoint: .top, endPoint: .bottom
+                    )
+                }
+        }
+        .ignoresSafeArea()
+    }
+}
+
 struct ContentView: View {
     @Environment(\.openURL) private var openURL
-    /// Eksterni izvor pesama (otvara se u pregledaču).
+    /// External source for songs (opens in the browser).
     private let downloadURL = URL(string: "https://st-tancpol.ru/music")!
 
-    // Deljena instanca: SwiftUI ume više puta da izvrši inicijalizator view-a,
-    // a svaki `StemMixerEngine()` bi iznova vezao globalne mostove (remote
-    // komande, Live Activity) za novu praznu instancu — v. StemMixerEngine.shared.
+    // Shared instance: SwiftUI can run a view's initializer multiple times,
+    // and every `StemMixerEngine()` would re-bind the global bridges (remote
+    // commands, Live Activity) to a new empty instance — see StemMixerEngine.shared.
     @State private var engine = StemMixerEngine.shared
     @State private var separator = DemucsSeparator()
     @State private var metronome = Metronome()
@@ -41,31 +72,31 @@ struct ContentView: View {
     @State private var loadError: String?
     @State private var separationTask: Task<Void, Never>?
     @State private var library: [CachedSong] = []
-    /// Ime pesme koja je trenutno učitana (prikazuje se u headeru umesto „Mazut").
+    /// Name of the currently loaded song (shown in the header instead of "Mazut").
     @State private var nowPlayingTitle: String?
-    /// Ključ (id) pesme koja trenutno svira — za auto-prelazak na sledeću.
+    /// Key (id) of the currently playing song — for auto-advance to the next one.
     @State private var nowPlayingID: String?
-    /// Kriterijum sortiranja biblioteke (podrazumevano: datum). Pamti se između pokretanja.
+    /// Library sort criterion (default: date). Persisted across launches.
     @AppStorage("librarySort") private var librarySortRaw = LibrarySort.date.rawValue
 
-    // MARK: - Plejliste i red reprodukcije
+    // MARK: - Playlists and playback queue
 
     @State private var playlists: [Playlist] = []
     @State private var selectedTab = 0
-    /// Pesma za koju je otvoren „Dodaj u plejlistu" list (swipe udesno).
+    /// Song for which the "Add to Playlist" sheet is open (swipe right).
     @State private var songToAdd: CachedSong?
     @State private var showNewPlaylistAlert = false
     @State private var newPlaylistName = ""
-    /// Trenutni red reprodukcije i da li se ide na sledeću po završetku.
+    /// Current playback queue and whether to advance to the next song when it finishes.
     @State private var playQueue: [CachedSong] = []
     @State private var autoAdvance = false
-    /// Pauza (sekunde) između pesama trenutne plejliste.
+    /// Pause (seconds) between songs in the current playlist.
     @State private var playbackDelay = 0
-    /// Task koji čeka pauzu pa pušta sledeću pesmu (otkazuje se pri ručnoj akciji).
+    /// Task that waits out the pause, then plays the next song (cancelled on manual action).
     @State private var delayTask: Task<Void, Never>?
-    /// Ponavljanje trenutne pesme (nezavisno od reda/plejliste).
+    /// Repeat the current song (independent of the queue/playlist).
     @State private var repeatEnabled = false
-    /// Nasumičan izbor sledeće pesme iz reda, umesto sledeće po redosledu.
+    /// Random pick of the next song from the queue, instead of the next one in order.
     @State private var shuffleEnabled = false
 
     var body: some View {
@@ -94,8 +125,8 @@ struct ContentView: View {
                 loadError = error.localizedDescription
             }
         }
-        .alert("Greška", isPresented: .constant(loadError != nil)) {
-            Button("U redu") { loadError = nil }
+        .alert("Error", isPresented: .constant(loadError != nil)) {
+            Button("OK") { loadError = nil }
         } message: {
             Text(loadError ?? "")
         }
@@ -105,35 +136,45 @@ struct ContentView: View {
         .overlay { if separator.isRunning { separationOverlay } }
     }
 
-    // MARK: - Tabovi (donji meni)
+    // MARK: - Tabs (bottom menu)
 
     private var tabs: some View {
         TabView(selection: $selectedTab) {
             libraryTab
-                .tabItem { Label("Pesme", systemImage: "plus.circle.fill") }
+                .tabItem { Label("Songs", systemImage: "plus.circle.fill") }
                 .tag(0)
             playlistsTab
-                .tabItem { Label("Plejliste", systemImage: "music.note.list") }
+                .tabItem { Label("Playlists", systemImage: "music.note.list") }
                 .tag(1)
             metronomeTab
-                .tabItem { Label("Metronom", systemImage: "metronome") }
+                .tabItem { Label("Metronome", systemImage: "metronome") }
                 .tag(2)
+            LearningTab()
+                .tabItem { Label("Learning", systemImage: "graduationcap") }
+                .tag(3)
             // tunerTab
-            //     .tabItem { Label("Štimer", systemImage: "tuningfork") }
-            //     .tag(3)
+            //     .tabItem { Label("Tuner", systemImage: "tuningfork") }
+            //     .tag(4)
         }
+        // The wallpaper behind these tabs is dark, so force dark-mode text/controls
+        // regardless of system appearance — default light-mode (near-black) text is
+        // unreadable against it otherwise.
+        .preferredColorScheme(.dark)
         .onChange(of: selectedTab) { _, newValue in
-            // Štimer snima samo dok je njegov tab otvoren.
-            if newValue != 3 { tuner.stop() }
+            // The tuner only records while its tab is open.
+            if newValue != 4 { tuner.stop() }
         }
     }
 
-    // MARK: - Tab: Pesme (biblioteka „Ranije razdvojeno" + dodavanje novih)
+    // MARK: - Tab: Songs (library "Previously separated" + adding new ones)
 
     private var libraryTab: some View {
         NavigationStack {
-            Group {
-                if library.isEmpty { emptyState } else { libraryView }
+            ZStack {
+                TabBackgroundView()
+                Group {
+                    if library.isEmpty { emptyState } else { libraryView }
+                }
             }
             .navigationTitle("Mazut")
         }
@@ -146,8 +187,8 @@ struct ContentView: View {
                 Section {
                     ForEach(songs) { song in
                         Button {
-                            // Red = cela (sortirana) biblioteka → ručno prebacivanje radi,
-                            // ali bez auto-prelaska na kraju pesme.
+                            // Queue = the whole (sorted) library → manual switching works,
+                            // but without auto-advance at the end of the song.
                             playbackDelay = 0
                             openCached(song, queue: songs, autoAdvance: false)
                         } label: {
@@ -158,7 +199,7 @@ struct ContentView: View {
                             Button {
                                 songToAdd = song
                             } label: {
-                                Label("U plejlistu", systemImage: "text.badge.plus")
+                                Label("To playlist", systemImage: "text.badge.plus")
                             }
                             .tint(.green)
                         }
@@ -169,46 +210,47 @@ struct ContentView: View {
                     }
                 } header: {
                     HStack {
-                        Text("Ranije razdvojeno")
+                        Text("Previously separated")
                         Spacer()
                         Menu {
-                            Picker("Sortiraj", selection: $librarySortRaw) {
+                            Picker("Sort", selection: $librarySortRaw) {
                                 ForEach(LibrarySort.allCases) { sort in
                                     Label(sort.label, systemImage: sort.systemImage)
                                         .tag(sort.rawValue)
                                 }
                             }
                         } label: {
-                            Label("Sortiraj", systemImage: "arrow.up.arrow.down")
+                            Label("Sort", systemImage: "arrow.up.arrow.down")
                                 .labelStyle(.iconOnly)
                         }
                     }
                 } footer: {
                     let total = library.reduce(Int64(0)) { $0 + $1.size }
-                    Text("\(library.count) \(pesmaPlural(library.count)) · ukupno \(total.formatted(.byteCount(style: .file)))")
+                    Text("\(library.count) \(songPlural(library.count)) · total \(total.formatted(.byteCount(style: .file)))")
                 }
             }
             .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
 
             addNewMenu
         }
     }
 
-    /// Meni „Dodaj novu" (razdvoj / preuzmi).
+    /// "Add new" menu (separate / download).
     private var addNewMenu: some View {
         Menu {
             Button {
                 showImporter = true
             } label: {
-                Label("Razdvoj pesmu", systemImage: "wand.and.stars")
+                Label("Separate a song", systemImage: "wand.and.stars")
             }
             Button {
                 openURL(downloadURL)
             } label: {
-                Label("Preuzmi pesme", systemImage: "globe")
+                Label("Download songs", systemImage: "globe")
             }
         } label: {
-            Label("Dodaj novu", systemImage: "plus")
+            Label("Add new", systemImage: "plus")
                 .font(.headline)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 6)
@@ -217,35 +259,15 @@ struct ContentView: View {
         .padding()
     }
 
-    // MARK: - Tab: Plejliste
+    // MARK: - Tab: Playlists
 
     private var playlistsTab: some View {
         NavigationStack {
-            Group {
-                if playlists.isEmpty {
-                    playlistsEmptyState
-                } else {
-                    List {
-                        ForEach(playlists) { playlist in
-                            NavigationLink {
-                                PlaylistDetailView(
-                                    playlistID: playlist.id,
-                                    playlists: $playlists,
-                                    library: library,
-                                    onPlay: { song, queue, delay in
-                                        playbackDelay = delay
-                                        openCached(song, queue: queue, autoAdvance: true, autoPlay: true)
-                                    }
-                                )
-                            } label: {
-                                playlistRow(playlist)
-                            }
-                        }
-                        .onDelete { offsets in deletePlaylists(offsets) }
-                    }
-                }
+            ZStack {
+                TabBackgroundView()
+                playlistsContent
             }
-            .navigationTitle("Plejliste")
+            .navigationTitle("Playlists")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -256,10 +278,38 @@ struct ContentView: View {
                     }
                 }
             }
-            .alert("Nova plejlista", isPresented: $showNewPlaylistAlert) {
-                TextField("Naziv", text: $newPlaylistName)
-                Button("Otkaži", role: .cancel) {}
-                Button("Napravi") { _ = createPlaylist(newPlaylistName) }
+            .alert("New Playlist", isPresented: $showNewPlaylistAlert) {
+                TextField("Name", text: $newPlaylistName)
+                Button("Cancel", role: .cancel) {}
+                Button("Create") { _ = createPlaylist(newPlaylistName) }
+            }
+        }
+    }
+
+    private var playlistsContent: some View {
+        Group {
+            if playlists.isEmpty {
+                playlistsEmptyState
+            } else {
+                List {
+                    ForEach(playlists) { playlist in
+                        NavigationLink {
+                            PlaylistDetailView(
+                                playlistID: playlist.id,
+                                playlists: $playlists,
+                                library: library,
+                                onPlay: { song, queue, delay in
+                                    playbackDelay = delay
+                                    openCached(song, queue: queue, autoAdvance: true, autoPlay: true)
+                                }
+                            )
+                        } label: {
+                            playlistRow(playlist)
+                        }
+                    }
+                    .onDelete { offsets in deletePlaylists(offsets) }
+                }
+                .scrollContentBackground(.hidden)
             }
         }
     }
@@ -269,9 +319,9 @@ struct ContentView: View {
             Image(systemName: "music.note.list")
                 .font(.system(size: 56))
                 .foregroundStyle(.secondary)
-            Text("Nema plejlista")
+            Text("No playlists")
                 .font(.title2.bold())
-            Text("Napravi plejlistu pa dodaj pesme prevlačenjem udesno u tabu Pesme.")
+            Text("Create a playlist, then add songs by swiping right in the Songs tab.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -280,7 +330,7 @@ struct ContentView: View {
                 newPlaylistName = ""
                 showNewPlaylistAlert = true
             } label: {
-                Label("Nova plejlista", systemImage: "plus")
+                Label("New Playlist", systemImage: "plus")
                     .font(.headline)
             }
             .buttonStyle(.borderedProminent)
@@ -294,18 +344,27 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(playlist.name)
                     .font(.body)
-                Text("\(playlist.songIDs.count) \(pesmaPlural(playlist.songIDs.count))")
+                Text("\(playlist.songIDs.count) \(songPlural(playlist.songIDs.count))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
     }
 
-    // MARK: - Tab: Metronom (placeholder)
+    // MARK: - Tab: Metronome (placeholder)
 
     private var metronomeTab: some View {
         NavigationStack {
-            VStack(spacing: 28) {
+            ZStack {
+                TabBackgroundView()
+                metronomeContent
+            }
+            .navigationTitle("Metronome")
+        }
+    }
+
+    private var metronomeContent: some View {
+        VStack(spacing: 28) {
                 Spacer()
 
                 // Tempo
@@ -319,7 +378,7 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                // Indikator dobara
+                // Beat indicator
                 HStack(spacing: 14) {
                     ForEach(0..<metronome.beatsPerMeasure, id: \.self) { i in
                         Circle()
@@ -332,7 +391,7 @@ struct ContentView: View {
                 }
                 .frame(height: 28)
 
-                // Podešavanje tempa
+                // Tempo adjustment
                 HStack(spacing: 20) {
                     Button { metronome.bpm = max(40, metronome.bpm - 1) } label: {
                         Image(systemName: "minus.circle.fill").font(.largeTitle)
@@ -351,8 +410,8 @@ struct ContentView: View {
                 .buttonStyle(.plain)
                 .padding(.horizontal)
 
-                // Takt (broj dobara)
-                Picker("Takt", selection: $metronome.beatsPerMeasure) {
+                // Time signature (number of beats)
+                Picker("Time signature", selection: $metronome.beatsPerMeasure) {
                     ForEach([1, 2, 3, 4, 6], id: \.self) { n in
                         Text(n == 1 ? "1/1" : "\(n)/4").tag(n)
                     }
@@ -375,14 +434,12 @@ struct ContentView: View {
                 .padding(.horizontal)
 
                 Spacer()
-            }
-            .padding()
-            .navigationTitle("Metronom")
         }
+        .padding()
     }
 
-    /// Boja kružića dobra: aktivan dobar svetli (prvi crveno, ostali akcenat).
-    /// U 1/1 boja se ne menja po dobru — stalna dok svira.
+    /// Beat dot color: the active beat lights up (first one red, others accent).
+    /// In 1/1 the color doesn't change per beat — it stays constant while running.
     private func beatColor(_ i: Int) -> Color {
         if metronome.beatsPerMeasure == 1 {
             return metronome.isRunning ? .accentColor : Color.gray.opacity(0.3)
@@ -393,23 +450,23 @@ struct ContentView: View {
         return Color.gray.opacity(0.3)
     }
 
-    // MARK: - Tab: Štimer (tuner za gitaru)
+    // MARK: - Tab: Tuner (guitar tuner)
 
-    /// U štimu kad postoji signal i odstupanje je manje od 5 centi.
+    /// In tune when there is a signal and the deviation is less than 5 cents.
     private var tunerInTune: Bool { tuner.hasSignal && abs(tuner.cents) < 5 }
 
     private var tunerTab: some View {
         NavigationStack {
             VStack(spacing: 28) {
-                // Izbor štima
-                Picker("Štim", selection: $tuner.tuning) {
+                // Tuning selection
+                Picker("Tuning", selection: $tuner.tuning) {
                     ForEach(GuitarTuning.all) { Text($0.name).tag($0) }
                 }
                 .pickerStyle(.menu)
 
                 Spacer()
 
-                // Velika nota + odstupanje
+                // Large note + deviation
                 VStack(spacing: 4) {
                     Text(tuner.hasSignal ? tuner.noteNameWithOctave : "—")
                         .font(.system(size: 88, weight: .bold, design: .rounded))
@@ -418,7 +475,7 @@ struct ContentView: View {
                         .animation(.easeOut(duration: 0.12), value: tuner.midiNote)
                     Text(tuner.hasSignal
                          ? "\(tuner.cents >= 0 ? "+" : "")\(Int(tuner.cents.rounded())) c · \(Int(tuner.frequency.rounded())) Hz"
-                         : "odsviraj žicu")
+                         : "play a string")
                         .font(.headline)
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
@@ -426,7 +483,7 @@ struct ContentView: View {
 
                 centsMeter
 
-                // Ciljne žice (sakriveno u hromatskom režimu)
+                // Target strings (hidden in chromatic mode)
                 if !tuner.tuning.isChromatic {
                     let nearest = tuner.hasSignal
                         ? tuner.tuning.nearestString(toMidi: tuner.midiNote) : nil
@@ -445,7 +502,7 @@ struct ContentView: View {
                 }
 
                 if tuner.permissionDenied {
-                    Text("Pristup mikrofonu je odbijen. Uključi ga u Podešavanja → Mazut → Mikrofon.")
+                    Text("Microphone access was denied. Enable it in Settings → Mazut → Microphone.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -454,13 +511,13 @@ struct ContentView: View {
                 Spacer()
             }
             .padding()
-            .navigationTitle("Štimer")
+            .navigationTitle("Tuner")
             .onAppear { tuner.start() }
             .onDisappear { tuner.stop() }
         }
     }
 
-    /// Horizontalni indikator centi: centar = u štimu, igla klizi levo/desno.
+    /// Horizontal cents meter: center = in tune, needle slides left/right.
     private var centsMeter: some View {
         GeometryReader { geo in
             let w = geo.size.width
@@ -470,12 +527,12 @@ struct ContentView: View {
                     .fill(Color.gray.opacity(0.2))
                     .frame(height: 6)
                     .frame(maxHeight: .infinity, alignment: .center)
-                // Centralna oznaka
+                // Center mark
                 Rectangle()
                     .fill(Color.secondary)
                     .frame(width: 2)
                     .position(x: w / 2, y: geo.size.height / 2)
-                // Igla
+                // Needle
                 Circle()
                     .fill(tunerInTune ? Color.green : Color.accentColor)
                     .frame(width: 22, height: 22)
@@ -494,15 +551,15 @@ struct ContentView: View {
         return tunerInTune ? .green : .accentColor
     }
 
-    // MARK: - „Dodaj u plejlistu" (swipe udesno)
+    // MARK: - "Add to Playlist" (swipe right)
 
     private func addToPlaylistSheet(_ song: CachedSong) -> some View {
         NavigationStack {
             List {
-                Section("Nova plejlista") {
+                Section("New Playlist") {
                     HStack {
-                        TextField("Naziv", text: $newPlaylistName)
-                        Button("Dodaj") {
+                        TextField("Name", text: $newPlaylistName)
+                        Button("Add") {
                             let pl = createPlaylist(newPlaylistName)
                             addSong(song, to: pl)
                             songToAdd = nil
@@ -511,7 +568,7 @@ struct ContentView: View {
                     }
                 }
                 if !playlists.isEmpty {
-                    Section("Postojeće") {
+                    Section("Existing") {
                         ForEach(playlists) { pl in
                             Button {
                                 addSong(song, to: pl)
@@ -531,24 +588,24 @@ struct ContentView: View {
                     }
                 }
             }
-            .navigationTitle("Dodaj u plejlistu")
+            .navigationTitle("Add to Playlist")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Otkaži") { songToAdd = nil }
+                    Button("Cancel") { songToAdd = nil }
                 }
             }
             .onAppear { newPlaylistName = "" }
         }
     }
 
-    // MARK: - Mutacije plejlista
+    // MARK: - Playlist mutations
 
     @discardableResult
     private func createPlaylist(_ name: String) -> Playlist {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         let pl = Playlist(id: UUID().uuidString,
-                          name: trimmed.isEmpty ? "Plejlista" : trimmed,
+                          name: trimmed.isEmpty ? "Playlist" : trimmed,
                           songIDs: [])
         playlists.append(pl)
         PlaylistStore.save(playlists)
@@ -567,7 +624,7 @@ struct ContentView: View {
         PlaylistStore.save(playlists)
     }
 
-    // MARK: - Plejer (prikazuje se dok je pesma učitana)
+    // MARK: - Player (shown while a song is loaded)
 
     private var playerView: some View {
         NavigationStack {
@@ -581,7 +638,7 @@ struct ContentView: View {
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button { backToList() } label: {
-                        Label("Nazad", systemImage: "chevron.left")
+                        Label("Back", systemImage: "chevron.left")
                     }
                 }
             }
@@ -607,14 +664,14 @@ struct ContentView: View {
                 ProgressView(value: separator.progress)
                     .progressViewStyle(.linear)
                     .frame(width: 220)
-                Text("Razdvajam stemove… \(Int(separator.progress * 100))%")
+                Text("Separating stems… \(Int(separator.progress * 100))%")
                     .font(.headline)
                     .foregroundStyle(.white)
 
                 Button(role: .cancel) {
                     separationTask?.cancel()
                 } label: {
-                    Text("Odustani")
+                    Text("Cancel")
                         .font(.subheadline.bold())
                         .padding(.horizontal, 20)
                         .padding(.vertical, 8)
@@ -627,7 +684,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Prazno stanje
+    // MARK: - Empty state
 
     private var emptyState: some View {
         VStack(spacing: 16) {
@@ -635,9 +692,9 @@ struct ContentView: View {
             Image(systemName: "waveform.badge.plus")
                 .font(.system(size: 56))
                 .foregroundStyle(.secondary)
-            Text("Razdvoj pesmu")
+            Text("Separate a song")
                 .font(.title2.bold())
-            Text("Izaberi audio fajl. Automatski se razdvaja na 6 stemova: vokal, bubnjevi, bas, gitara, klavir, ostalo.")
+            Text("Choose an audio file. It's automatically separated into 6 stems: vocals, drums, bass, guitar, piano, other.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -645,7 +702,7 @@ struct ContentView: View {
             Button {
                 showImporter = true
             } label: {
-                Label("Razdvoj pesmu", systemImage: "wand.and.stars")
+                Label("Separate a song", systemImage: "wand.and.stars")
                     .font(.headline)
             }
             .buttonStyle(.borderedProminent)
@@ -654,20 +711,20 @@ struct ContentView: View {
             Button {
                 openURL(downloadURL)
             } label: {
-                Label("Preuzmi pesme", systemImage: "globe")
+                Label("Download songs", systemImage: "globe")
                     .font(.subheadline)
             }
             Spacer()
         }
     }
 
-    // MARK: - Sortiranje biblioteke
+    // MARK: - Library sorting
 
-    /// Biblioteka poređana po izabranom kriterijumu.
+    /// Library ordered by the selected criterion.
     private var sortedLibrary: [CachedSong] {
         switch LibrarySort(rawValue: librarySortRaw) ?? .date {
         case .date:
-            return library.sorted { $0.date > $1.date }          // najnovije prvo
+            return library.sorted { $0.date > $1.date }          // newest first
         case .title:
             return library.sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
         case .artist:
@@ -677,26 +734,22 @@ struct ContentView: View {
         }
     }
 
-    /// Srpska množina za „pesma": 1 → pesma, 2–4 → pesme, ostalo → pesama
-    /// (izuzeci 11–14 → pesama).
-    private func pesmaPlural(_ n: Int) -> String {
-        let d = n % 10, dd = n % 100
-        if d == 1 && dd != 11 { return "pesma" }
-        if (2...4).contains(d) && !(12...14).contains(dd) { return "pesme" }
-        return "pesama"
+    /// English plural for "song": 1 → song, otherwise → songs.
+    private func songPlural(_ n: Int) -> String {
+        n == 1 ? "song" : "songs"
     }
 
-    // MARK: - Reprodukcija
+    // MARK: - Playback
 
-    /// Učitaj keširanu pesmu u mikser bez ponovnog razdvajanja.
-    /// `queue` je red reprodukcije, `autoAdvance` da li se na kraju ide na sledeću,
-    /// `autoPlay` da li odmah počinje reprodukcija.
+    /// Load a cached song into the mixer without re-running separation.
+    /// `queue` is the playback queue, `autoAdvance` whether to advance to the next
+    /// song at the end, `autoPlay` whether playback starts immediately.
     private func openCached(_ song: CachedSong, queue: [CachedSong],
                             autoAdvance: Bool, autoPlay: Bool = false) {
         delayTask?.cancel()
         self.playQueue = queue
         self.autoAdvance = autoAdvance
-        // Prenesi podešavanja (jačina / mute / solo) sa prethodne pesme.
+        // Carry over settings (volume / mute / solo) from the previous song.
         let prev = Dictionary(stems.map { ($0.kind, $0) }, uniquingKeysWith: { a, _ in a })
         let assigned = StemKind.allCases.map { kind -> Stem in
             let stem = Stem(kind: kind)
@@ -721,10 +774,10 @@ struct ContentView: View {
         }
     }
 
-    /// Pređi na sledeću pesmu (kraj pesme, prirodan završetak). Ako je uključeno
-    /// ponavljanje, samo vrti istu pesmu ispočetka; u suprotnom bira sledeću —
-    /// nasumičnu (shuffle) ili po redosledu, ali samo ako je auto-prelazak uključen
-    /// (tj. reprodukcija je krenula iz plejliste) — shuffle to zahtevanje zaobilazi.
+    /// Advance to the next song (song ended naturally). If repeat is enabled,
+    /// just restarts the same song from the beginning; otherwise picks the next one —
+    /// random (shuffle) or in order, but only if auto-advance is enabled
+    /// (i.e. playback started from a playlist) — shuffle bypasses that requirement.
     private func playNext() {
         if repeatEnabled {
             engine.seek(to: 0)
@@ -736,7 +789,7 @@ struct ContentView: View {
             openCached(next, queue: playQueue, autoAdvance: autoAdvance, autoPlay: true)
             return
         }
-        // Pauza između pesama, pa pusti sledeću (osim ako korisnik prekine).
+        // Pause between songs, then play the next one (unless the user interrupts).
         delayTask?.cancel()
         delayTask = Task {
             try? await Task.sleep(for: .seconds(playbackDelay))
@@ -745,8 +798,8 @@ struct ContentView: View {
         }
     }
 
-    /// Sledeća pesma za auto-prelazak na kraju pesme: nasumična (shuffle, uvek
-    /// dostupna) ili sledeća po redu (samo kad je auto-prelazak uključen).
+    /// Next song for auto-advance at the end of a song: random (shuffle, always
+    /// available) or next in order (only when auto-advance is enabled).
     private func nextSongForAdvance() -> CachedSong? {
         guard let idx = currentQueueIndex else { return nil }
         if shuffleEnabled { return randomOtherSong(excluding: idx) }
@@ -754,14 +807,14 @@ struct ContentView: View {
         return playQueue[idx + 1]
     }
 
-    /// Nasumična pesma iz reda, različita od one na indeksu `idx` (ako ih ima više).
+    /// Random song from the queue, different from the one at index `idx` (if there's more than one).
     private func randomOtherSong(excluding idx: Int) -> CachedSong? {
         let candidates = playQueue.indices.filter { $0 != idx }
         guard let j = candidates.randomElement() else { return nil }
         return playQueue[j]
     }
 
-    /// Pozicija trenutne pesme u redu reprodukcije.
+    /// Position of the current song in the playback queue.
     private var currentQueueIndex: Int? {
         guard let id = nowPlayingID else { return nil }
         return playQueue.firstIndex { $0.id == id }
@@ -773,22 +826,22 @@ struct ContentView: View {
         return i + 1 < playQueue.count
     }
 
-    /// Ručno (dugme „prethodna"): prvi pritisak vraća na početak pesme; ako je
-    /// proteklo ≤ 5 s reprodukcije, prelazi na prethodnu pesmu u redu.
+    /// Manual ("previous" button): first press rewinds to the start of the song; if ≤ 5s
+    /// of playback have elapsed, moves to the previous song in the queue.
     private func playPrevious() {
         if engine.currentTime > 5 {
             engine.seek(to: 0)
             return
         }
         guard let i = currentQueueIndex, i > 0 else {
-            engine.seek(to: 0)   // nema prethodne → samo na početak
+            engine.seek(to: 0)   // no previous song → just rewind to start
             return
         }
         openCached(playQueue[i - 1], queue: playQueue, autoAdvance: autoAdvance, autoPlay: true)
     }
 
-    /// Ručno (dugme) — sledeća pesma u redu (nasumična ako je shuffle uključen,
-    /// inače po redosledu); zadržava trenutni način prelaska.
+    /// Manual (button) — next song in the queue (random if shuffle is enabled,
+    /// otherwise in order); preserves the current advance mode.
     private func playNextManual() {
         guard let i = currentQueueIndex else { return }
         if shuffleEnabled {
@@ -867,8 +920,8 @@ struct ContentView: View {
         .padding()
     }
 
-    /// Kompaktna metronom traka ispod transport dugmadi — pali/gasi + tempo.
-    /// Metronom svira preko pesme i zadržava stanje između pesama u plejlisti.
+    /// Compact metronome bar below the transport buttons — on/off + tempo.
+    /// The metronome plays over the song and keeps its state between songs in a playlist.
     private var metronomeBar: some View {
         HStack(spacing: 14) {
             Button {
@@ -880,7 +933,7 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
 
-            // Živi pokazivač dobra.
+            // Live beat indicator.
             Circle()
                 .fill(metronomeDotColor)
                 .frame(width: 10, height: 10)
@@ -909,7 +962,7 @@ struct ContentView: View {
         return .accentColor
     }
 
-    // MARK: - Stemovi
+    // MARK: - Stems
 
     private var stemList: some View {
         List(stems) { stem in
@@ -923,7 +976,7 @@ struct ContentView: View {
     // MARK: - Import
 
     private func separateSong(_ url: URL) {
-        guard let local = copyToTemp(url) else { loadError = "Ne mogu da učitam fajl."; return }
+        guard let local = copyToTemp(url) else { loadError = "Can't load the file."; return }
         separationTask = Task {
             do {
                 let map = try await separator.separate(url: local)
@@ -934,9 +987,9 @@ struct ContentView: View {
                 autoAdvance = false
                 try engine.load(stems: stems)
                 nowPlayingTitle = local.deletingPathExtension().lastPathComponent
-                // Ključ pesme = ime foldera u kome su stemovi (hash sadržaja).
+                // Song key = the name of the folder containing the stems (content hash).
                 nowPlayingID = map.values.first?.deletingLastPathComponent().lastPathComponent
-                library = StemCache.library()   // nova pesma je sad u kešu
+                library = StemCache.library()   // the new song is now in the cache
                 if let cached = library.first(where: { $0.id == nowPlayingID }) {
                     engine.setNowPlaying(title: cached.title, artist: cached.artist,
                                          artworkURL: cached.artworkURL)
@@ -944,7 +997,7 @@ struct ContentView: View {
                     engine.setNowPlaying(title: nowPlayingTitle ?? "Mazut")
                 }
             } catch is CancellationError {
-                // Korisnik je odustao — bez greške, samo se vrati na izbor pesme.
+                // The user cancelled — no error, just return to song selection.
             } catch {
                 loadError = error.localizedDescription
             }
@@ -976,7 +1029,7 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Red jedne pesme (deljeno: biblioteka + plejliste)
+// MARK: - Row for a single song (shared: library + playlists)
 
 struct SongRow: View {
     let song: CachedSong
@@ -999,7 +1052,7 @@ struct SongRow: View {
         }
     }
 
-    /// Sličica pesme: ugrađeni album art ako postoji, inače placeholder s notom.
+    /// Song thumbnail: embedded album art if present, otherwise a placeholder with a note icon.
     @ViewBuilder
     private var artwork: some View {
         let side: CGFloat = 44
@@ -1020,7 +1073,7 @@ struct SongRow: View {
         }
     }
 
-    /// Podnaslov: izvođač · trajanje · datum (izostavlja prazne delove).
+    /// Subtitle: artist · duration · date (omits empty parts).
     static func subtitle(for song: CachedSong) -> String {
         var parts: [String] = []
         if !song.artist.isEmpty { parts.append(song.artist) }
@@ -1036,23 +1089,23 @@ struct SongRow: View {
     }
 }
 
-// MARK: - Detalji plejliste
+// MARK: - Playlist details
 
 private struct PlaylistDetailView: View {
     let playlistID: String
     @Binding var playlists: [Playlist]
     let library: [CachedSong]
-    /// (pesma, ceo red, pauza u sekundama) → pusti pesmu sa auto-prelaskom na sledeću.
+    /// (song, full queue, pause in seconds) → play the song with auto-advance to the next.
     let onPlay: (CachedSong, [CachedSong], Int) -> Void
 
-    /// Ponuđene pauze između pesama (sekunde).
+    /// Offered pauses between songs (seconds).
     private let delayOptions = [0, 1, 2, 5, 10]
 
     private var playlist: Playlist? {
         playlists.first { $0.id == playlistID }
     }
 
-    /// Pesme plejliste, redosledom; preskaču se one obrisane iz keša.
+    /// Playlist songs, in order; ones removed from the cache are skipped.
     private var songs: [CachedSong] {
         guard let playlist else { return [] }
         let byID = Dictionary(library.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
@@ -1066,9 +1119,9 @@ private struct PlaylistDetailView: View {
                     Image(systemName: "music.note")
                         .font(.system(size: 48))
                         .foregroundStyle(.secondary)
-                    Text("Plejlista je prazna")
+                    Text("Playlist is empty")
                         .font(.headline)
-                    Text("Dodaj pesme prevlačenjem udesno u tabu Pesme.")
+                    Text("Add songs by swiping right in the Songs tab.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -1089,24 +1142,24 @@ private struct PlaylistDetailView: View {
                         .onMove { move(from: $0, to: $1) }
                     } header: {
                         if let delay = playlist?.delay, delay > 0 {
-                            Text("Pauza između pesama: \(delay) s")
+                            Text("Pause between songs: \(delay) s")
                         }
                     }
                 }
             }
         }
-        .navigationTitle(playlist?.name ?? "Plejlista")
+        .navigationTitle(playlist?.name ?? "Playlist")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
-                    Picker("Pauza između pesama", selection: delayBinding) {
+                    Picker("Pause between songs", selection: delayBinding) {
                         ForEach(delayOptions, id: \.self) { sec in
-                            Text(sec == 0 ? "Bez pauze" : "\(sec) s").tag(sec)
+                            Text(sec == 0 ? "No pause" : "\(sec) s").tag(sec)
                         }
                     }
                 } label: {
-                    Label("Pauza", systemImage: "timer")
+                    Label("Pause", systemImage: "timer")
                 }
             }
             if !songs.isEmpty {
@@ -1115,7 +1168,7 @@ private struct PlaylistDetailView: View {
         }
     }
 
-    /// Binding na pauzu plejliste (čita iz modela, upisuje i snima).
+    /// Binding to the playlist pause (reads from the model, writes and saves).
     private var delayBinding: Binding<Int> {
         Binding(
             get: { playlist?.delay ?? 0 },
@@ -1141,11 +1194,11 @@ private struct PlaylistDetailView: View {
     }
 }
 
-// MARK: - Red jednog stema
+// MARK: - Row for a single stem
 
 private struct StemRow: View {
     @Bindable var stem: Stem
-    /// Pozvati kad se promeni bilo koja kontrola da engine osvezi mix.
+    /// Call when any control changes so the engine refreshes the mix.
     let onChange: () -> Void
 
     var body: some View {
@@ -1156,7 +1209,7 @@ private struct StemRow: View {
                 Text(stem.displayName)
                     .font(.headline)
                 if stem.url == nil {
-                    Text("— prazno")
+                    Text("— empty")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                 }
@@ -1196,9 +1249,9 @@ private struct StemRow: View {
     }
 }
 
-// MARK: - Sortiranje biblioteke
+// MARK: - Library sorting
 
-/// Kriterijum sortiranja liste pesama.
+/// Song list sort criterion.
 private enum LibrarySort: String, CaseIterable, Identifiable {
     case date, title, artist, duration
 
@@ -1206,10 +1259,10 @@ private enum LibrarySort: String, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .date:     return "Datum"
-        case .title:    return "Naslov"
-        case .artist:   return "Izvođač"
-        case .duration: return "Trajanje"
+        case .date:     return "Date"
+        case .title:    return "Title"
+        case .artist:   return "Artist"
+        case .duration: return "Duration"
         }
     }
 

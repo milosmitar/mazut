@@ -2,13 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- Reprodukcija se nastavlja i kad je aplikacija u pozadini / telefon zaključan.
-	     Ovaj parcijalni plist se merguje sa generisanim (GENERATE_INFOPLIST_FILE). -->
+	<!-- Playback continues while the app is in the background / the phone is locked.
+	     This partial plist is merged with the generated one (GENERATE_INFOPLIST_FILE). -->
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
 	</array>
-	<!-- Live Activity kartica sa dugmićima za kanale na zaključanom ekranu. -->
+	<!-- Live Activity card with per-channel buttons on the lock screen. -->
 	<key>NSSupportsLiveActivities</key>
 	<true/>
 </dict>

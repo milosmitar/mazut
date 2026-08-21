@@ -2,21 +2,21 @@
 //  Playlist.swift
 //  Mazut
 //
-//  Korisničke plejliste — uređeni spiskovi ključeva keširanih pesama.
-//  Čuvaju se kao JSON pored keša stemova (Application Support/MazutStems/).
+//  User playlists — ordered lists of cached-song keys.
+//  Stored as JSON alongside the stem cache (Application Support/MazutStems/).
 //
 
 import Foundation
 
-/// Jedna plejlista: naziv + uređeni spisak ključeva (hash) keširanih pesama.
+/// A single playlist: name + ordered list of cached-song keys (hashes).
 nonisolated struct Playlist: Identifiable, Codable, Hashable {
     var id: String          // UUID
     var name: String
-    var songIDs: [String]   // ključevi pesama iz StemCache, redosledom reprodukcije
-    /// Pauza (sekunde) između pesama pri auto-prelasku. Opciono zbog starijeg JSON-a.
+    var songIDs: [String]   // song keys from StemCache, in playback order
+    /// Pause (seconds) between songs on auto-advance. Optional for backward-compatible JSON.
     var delaySeconds: Int?
 
-    /// Pauza u sekundama (0 = bez pauze).
+    /// Pause in seconds (0 = no pause).
     var delay: Int { delaySeconds ?? 0 }
 }
 

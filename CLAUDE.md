@@ -12,7 +12,7 @@ The repo has two halves:
 - `Mazut/` — the shipping app (Swift).
 - `conversion/` — Python + standalone-Swift scripts used to convert and verify the model. These are dev tooling, not part of the app build.
 
-Note: code, comments, and UI strings are in Serbian. Match that when editing.
+Note: app code, comments, and UI strings are in English (translated from Serbian in 2026-08). `conversion/` scripts and docs may still contain Serbian comments.
 
 ## Build & run
 
@@ -69,7 +69,15 @@ order:   drums, bass, other, vocals, guitar, piano   (== DemucsSeparator.modelOr
    also owns background playback: Now Playing info + remote commands (lock screen), audio
    session interruptions, and the Live Activity lifecycle.
 5. `ContentView` — single SwiftUI view: library list, file importer, transport, stem mixer.
-6. `MazutWidget/` — widget extension (`MazutWidgetExtension` target) with the lock-screen
+6. `Mazut/Learning/` — the "Learning" tab: user-created folders of lesson clips, each a local
+   video (picked via `PhotosPicker`, copied into `<Application Support>/MazutLearning/Media/`)
+   or a YouTube link (`ClipSource.youtube(videoID:)`). Folders/clips persist as JSON in
+   `LearningStore` (mirrors `PlaylistStore`). This is the **only feature in the app that touches
+   the network**: YouTube playback embeds the standard iframe player in a `WKWebView`
+   (`YouTubePlayerView`) since there's no way to get a directly playable URL from a YouTube
+   link without violating its terms; thumbnails/titles come from YouTube's public
+   `img.youtube.com` and `oembed` endpoints. Local clips play via AVKit's `VideoPlayer`.
+7. `MazutWidget/` — widget extension (`MazutWidgetExtension` target) with the lock-screen
    Live Activity: per-stem on/off buttons via `ToggleStemIntent` (an `AudioPlaybackIntent`,
    so it runs in the app process). `StemActivityShared.swift` compiles into **both** targets
    (sync-group membership exception in the pbxproj).

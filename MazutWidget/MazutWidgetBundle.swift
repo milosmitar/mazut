@@ -2,7 +2,7 @@
 //  MazutWidgetBundle.swift
 //  MazutWidget
 //
-//  Ulazna tačka widget ekstenzije — sadrži samo Live Activity za stemove.
+//  Entry point of the widget extension — contains only the stems Live Activity.
 //
 
 import SwiftUI

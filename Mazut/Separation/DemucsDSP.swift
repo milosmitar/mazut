@@ -2,21 +2,21 @@
 //  DemucsDSP.swift
 //  Mazut
 //
-//  STFT / ISTFT koji bit-tačno prate demucs htdemucs `_spec`/`_ispec`.
-//  Verifikovano protiv PyTorch reference na ~132 dB SNR (vidi conversion/).
-//  Kompleksni STFT se radi ovde (vDSP) jer Core ML ne podržava kompleksne tensore.
+//  STFT / ISTFT that bit-exactly match demucs htdemucs `_spec`/`_ispec`.
+//  Verified against the PyTorch reference at ~132 dB SNR (see conversion/).
+//  The complex STFT is done here (vDSP) because Core ML doesn't support complex tensors.
 //
 
 import Foundation
 import Accelerate
 
-/// Fiksni parametri modela htdemucs_6s (segment 7.8 s @ 44100).
+/// Fixed parameters of the htdemucs_6s model (7.8 s segment @ 44100).
 nonisolated enum DemucsParams {
     static let nFFT = 4096
     static let hop = 1024
     static let log2n = vDSP_Length(12)
     static let half = nFFT / 2            // 2048
-    static let freqBins = 2048            // posle [..., :-1, :]
+    static let freqBins = 2048            // after [..., :-1, :]
     static let sampleRate = 44100
     static let segmentSamples = 343980    // TL = int(7.8 * 44100)
     static let frames = 336               // le = ceil(N/hop)
@@ -33,9 +33,9 @@ nonisolated enum DemucsParams {
 
 private extension Double { var squareRootValue: Double { Foundation.sqrt(self) } }
 
-/// vDSP-bazirani STFT/ISTFT. Drži FFT setup i hann prozor (kreirati jednom).
-/// `nonisolated` — čiste funkcije (samo read-only `setup`/`hann`), bezbedne za
-/// poziv iz pozadinskih niti (concurrentPerform / pipeline).
+/// vDSP-based STFT/ISTFT. Holds the FFT setup and Hann window (created once).
+/// `nonisolated` — pure functions (only read-only `setup`/`hann`), safe to call
+/// from background threads (concurrentPerform / pipeline).
 nonisolated final class DemucsDSP: @unchecked Sendable {
     private let setup: FFTSetup
     private let hann: [Float]
@@ -52,7 +52,7 @@ nonisolated final class DemucsDSP: @unchecked Sendable {
 
     deinit { vDSP_destroy_fftsetup(setup) }
 
-    // MARK: - reflect pad (bez ivičnog elementa, kao torch)
+    // MARK: - reflect pad (without the edge element, like torch)
 
     private func reflectPad(_ x: [Float], _ left: Int, _ right: Int) -> [Float] {
         var out = [Float]()
@@ -65,8 +65,8 @@ nonisolated final class DemucsDSP: @unchecked Sendable {
 
     // MARK: - STFT: mix [C][N] (N=segmentSamples) -> mag flat [4 * 2048 * 336] (cac)
 
-    /// Vraća realni cac spektrogram, layout [ch(4)][freq(2048)][frame(336)] flat,
-    /// kanali: [L_re, L_im, R_re, R_im] — spreman za MLMultiArray [1,4,2048,336].
+    /// Returns the real-valued cac spectrogram, layout [ch(4)][freq(2048)][frame(336)] flat,
+    /// channels: [L_re, L_im, R_re, R_im] — ready for MLMultiArray [1,4,2048,336].
     func magnitude(mix: [[Float]]) -> [Float] {
         let F = P.freqBins, T = P.frames, n = P.nFFT, hop = P.hop, half = P.half
         var mag = [Float](repeating: 0, count: 4 * F * T)
@@ -94,7 +94,7 @@ nonisolated final class DemucsDSP: @unchecked Sendable {
                             vDSP_ctoz(raw.bindMemory(to: DSPComplex.self).baseAddress!, 2, &split, 1, vDSP_Length(half))
                         }
                         vDSP_fft_zrip(setup, &split, 1, P.log2n, FFTDirection(FFT_FORWARD))
-                        // bin 0 (DC) real; Nyquist (imagp[0]) se ne koristi.
+                        // bin 0 (DC) real; Nyquist (imagp[0]) is unused.
                         mag[(chRe * F + 0) * T + dataT] = rp[0] * P.fwdScale
                         mag[(chIm * F + 0) * T + dataT] = 0
                         for k in 1..<F {
@@ -108,10 +108,10 @@ nonisolated final class DemucsDSP: @unchecked Sendable {
         return mag
     }
 
-    // MARK: - ISTFT: jedan kanal, re/im flat [freqBins*frames] (indeks k*T+t) -> [segmentSamples]
+    // MARK: - ISTFT: one channel, re/im flat [freqBins*frames] (index k*T+t) -> [segmentSamples]
 
-    /// `re`/`im` su ravni baferi dužine freqBins*frames, indeksirani `k * frames + t`
-    /// (tako su kontinualni u spec_out MLMultiArray-u po kanalu → bez kopija).
+    /// `re`/`im` are flat buffers of length freqBins*frames, indexed `k * frames + t`
+    /// (matching the contiguous per-channel layout in the spec_out MLMultiArray → no copies).
     func istftChannel(re: UnsafePointer<Float>, im: UnsafePointer<Float>) -> [Float] {
         let F = P.freqBins, T = P.frames, n = P.nFFT, hop = P.hop, half = P.half
         let framesIn = T + 4
