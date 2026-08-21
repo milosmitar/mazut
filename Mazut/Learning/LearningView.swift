@@ -69,131 +69,40 @@ private struct PickedVideo: Transferable {
     }
 }
 
-// MARK: - Tab: top-level folder list
+// MARK: - Tab: root of the folder tree
 
+/// The Learning tab is just `LearningFolderView` rooted at the implicit
+/// top-level folder (`path: []`) — the root behaves exactly like any other
+/// folder (subfolders + items), so "add item" / "new folder" work the same
+/// everywhere, including here.
 struct LearningTab: View {
-    @State private var folders: [LearningFolder] = []
-    @State private var showNewFolderAlert = false
-    @State private var newFolderName = ""
+    @State private var root: LearningFolder = LearningFolder(id: LearningStore.rootID, name: "Learning")
 
     var body: some View {
         NavigationStack {
             ZStack {
                 TabBackgroundView()
-                Group {
-                    if folders.isEmpty {
-                        emptyState
-                    } else {
-                        List {
-                            ForEach(folders) { folder in
-                                NavigationLink {
-                                    LearningFolderView(path: [folder.id], folders: $folders)
-                                } label: {
-                                    folderRow(folder)
-                                }
-                            }
-                            .onDelete(perform: deleteFolders)
-                        }
-                        .scrollContentBackground(.hidden)
-                    }
-                }
-            }
-            .navigationTitle("Learning")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        newFolderName = ""
-                        showNewFolderAlert = true
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                }
-            }
-            .alert("New Folder", isPresented: $showNewFolderAlert) {
-                TextField("Name", text: $newFolderName)
-                Button("Cancel", role: .cancel) {}
-                Button("Create") { createFolder() }
+                LearningFolderView(path: [], root: $root)
             }
         }
-        .onAppear { folders = LearningStore.load() }
-    }
-
-    private var emptyState: some View {
-        VStack(spacing: 16) {
-            Spacer()
-            Image(systemName: "graduationcap")
-                .font(.system(size: 56))
-                .foregroundStyle(.secondary)
-            Text("No folders yet")
-                .font(.title2.bold())
-            Text("Create a folder (e.g. \"Scale lesson\") and add videos, photos, documents, or YouTube links.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 40)
-            Button {
-                newFolderName = ""
-                showNewFolderAlert = true
-            } label: {
-                Label("New Folder", systemImage: "plus")
-                    .font(.headline)
-            }
-            .buttonStyle(.borderedProminent)
-            Spacer()
-        }
-    }
-
-    private func folderRow(_ folder: LearningFolder) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: "folder.fill")
-                .foregroundStyle(Color.accentColor)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(folder.name)
-                    .font(.body)
-                Text(summary(folder))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private func summary(_ f: LearningFolder) -> String {
-        var parts: [String] = []
-        if !f.subfolders.isEmpty {
-            parts.append("\(f.subfolders.count) \(f.subfolders.count == 1 ? "folder" : "folders")")
-        }
-        if !f.clips.isEmpty {
-            parts.append("\(f.clips.count) \(f.clips.count == 1 ? "item" : "items")")
-        }
-        return parts.isEmpty ? "Empty" : parts.joined(separator: " · ")
-    }
-
-    private func createFolder() {
-        let trimmed = newFolderName.trimmingCharacters(in: .whitespaces)
-        let folder = LearningFolder(name: trimmed.isEmpty ? "Folder" : trimmed)
-        folders.append(folder)
-        LearningStore.save(folders)
-    }
-
-    private func deleteFolders(_ offsets: IndexSet) {
-        for i in offsets { LearningStore.deleteAllMedia(in: folders[i]) }
-        folders.remove(atOffsets: offsets)
-        LearningStore.save(folders)
+        .onAppear { root = LearningStore.load() }
     }
 }
 
 // MARK: - Folder detail (subfolders + items) — recurses into itself
 
 private struct LearningFolderView: View {
-    /// Folder IDs from a top-level folder down to, and including, this one.
+    /// Subfolder IDs from the root down to, and including, this folder. Empty = the root itself.
     let path: [String]
-    @Binding var folders: [LearningFolder]
+    @Binding var root: LearningFolder
 
     @State private var showNewSubfolderAlert = false
     @State private var newSubfolderName = ""
 
     @State private var pickedVideo: PhotosPickerItem?
     @State private var pickedImage: PhotosPickerItem?
+    @State private var showVideoPicker = false
+    @State private var showPhotoPicker = false
     @State private var showDocumentImporter = false
     @State private var showYouTubeAlert = false
     @State private var youtubeURLText = ""
@@ -201,7 +110,7 @@ private struct LearningFolderView: View {
     @State private var importError: String?
     @State private var playingClip: LearningClip?
 
-    private var folder: LearningFolder? { LearningStore.folder(at: path, in: folders) }
+    private var folder: LearningFolder? { LearningStore.folder(at: path, in: root) }
     private var subfolders: [LearningFolder] { folder?.subfolders ?? [] }
     private var clips: [LearningClip] { folder?.clips ?? [] }
 
@@ -215,7 +124,7 @@ private struct LearningFolderView: View {
                         Section("Folders") {
                             ForEach(subfolders) { sub in
                                 NavigationLink {
-                                    LearningFolderView(path: path + [sub.id], folders: $folders)
+                                    LearningFolderView(path: path + [sub.id], root: $root)
                                 } label: {
                                     subfolderRow(sub)
                                 }
@@ -238,10 +147,11 @@ private struct LearningFolderView: View {
                         }
                     }
                 }
+                .scrollContentBackground(.hidden)
             }
         }
         .navigationTitle(folder?.name ?? "Folder")
-        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarTitleDisplayMode(path.isEmpty ? .large : .inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) { addMenu }
             if !clips.isEmpty {
@@ -253,6 +163,13 @@ private struct LearningFolderView: View {
             Button("Cancel", role: .cancel) {}
             Button("Create") { createSubfolder() }
         }
+        // Triggered from `addMenu` via plain Buttons rather than embedding
+        // PhotosPicker directly as a menu row: PhotosPicker nested two levels
+        // deep inside a Menu-in-Menu silently fails to present on tap, so the
+        // picker is presented via this boolean instead, fully decoupled from
+        // the menu's own view hierarchy.
+        .photosPicker(isPresented: $showVideoPicker, selection: $pickedVideo, matching: .videos)
+        .photosPicker(isPresented: $showPhotoPicker, selection: $pickedImage, matching: .images)
         .onChange(of: pickedVideo) { _, newValue in
             guard let newValue else { return }
             importVideo(newValue)
@@ -283,7 +200,9 @@ private struct LearningFolderView: View {
             Text(importError ?? "")
         }
         .sheet(item: $playingClip) { clip in
-            ClipPreviewSheet(clip: clip)
+            ClipPreviewSheet(clip: clip) { newTitle in
+                renameClip(clip, to: newTitle)
+            }
         }
         .overlay {
             if isImporting {
@@ -302,26 +221,23 @@ private struct LearningFolderView: View {
             } label: {
                 Label("New Folder", systemImage: "folder.badge.plus")
             }
-            Menu {
-                PhotosPicker(selection: $pickedVideo, matching: .videos) {
-                    Label("Video", systemImage: "video")
-                }
-                PhotosPicker(selection: $pickedImage, matching: .images) {
-                    Label("Photo", systemImage: "photo")
-                }
-                Button {
-                    showDocumentImporter = true
-                } label: {
-                    Label("Document", systemImage: "doc")
-                }
-                Button {
-                    youtubeURLText = ""
-                    showYouTubeAlert = true
-                } label: {
-                    Label("YouTube", systemImage: "play.rectangle")
-                }
+            Divider()
+            Button { showVideoPicker = true } label: {
+                Label("Video", systemImage: "video")
+            }
+            Button { showPhotoPicker = true } label: {
+                Label("Photo", systemImage: "photo")
+            }
+            Button {
+                showDocumentImporter = true
             } label: {
-                Label("Add Item", systemImage: "plus.circle")
+                Label("Document", systemImage: "doc")
+            }
+            Button {
+                youtubeURLText = ""
+                showYouTubeAlert = true
+            } label: {
+                Label("YouTube", systemImage: "play.rectangle")
             }
         } label: {
             Image(systemName: "plus")
@@ -331,10 +247,10 @@ private struct LearningFolderView: View {
     private var emptyState: some View {
         VStack(spacing: 16) {
             Spacer()
-            Image(systemName: "tray")
+            Image(systemName: path.isEmpty ? "graduationcap" : "tray")
                 .font(.system(size: 48))
                 .foregroundStyle(.secondary)
-            Text("Empty folder")
+            Text(path.isEmpty ? "Nothing here yet" : "Empty folder")
                 .font(.headline)
             Text("Add a subfolder, or a video, photo, document, or YouTube link.")
                 .font(.subheadline)
@@ -423,14 +339,14 @@ private struct LearningFolderView: View {
     private func createSubfolder() {
         let trimmed = newSubfolderName.trimmingCharacters(in: .whitespaces)
         let sub = LearningFolder(name: trimmed.isEmpty ? "Folder" : trimmed)
-        LearningStore.mutate(at: path, in: &folders) { $0.subfolders.append(sub) }
-        LearningStore.save(folders)
+        LearningStore.mutate(at: path, in: &root) { $0.subfolders.append(sub) }
+        LearningStore.save(root)
     }
 
     private func deleteSubfolders(_ offsets: IndexSet) {
         for i in offsets { LearningStore.deleteAllMedia(in: subfolders[i]) }
-        LearningStore.mutate(at: path, in: &folders) { $0.subfolders.remove(atOffsets: offsets) }
-        LearningStore.save(folders)
+        LearningStore.mutate(at: path, in: &root) { $0.subfolders.remove(atOffsets: offsets) }
+        LearningStore.save(root)
     }
 
     // MARK: - Adding items
@@ -496,31 +412,39 @@ private struct LearningFolderView: View {
         // Best-effort: fill in the real title once it's fetched.
         Task {
             guard let title = await YouTube.fetchTitle(for: id) else { return }
-            LearningStore.mutate(at: path, in: &folders) { f in
+            LearningStore.mutate(at: path, in: &root) { f in
                 guard let idx = f.clips.firstIndex(where: { $0.id == clip.id }) else { return }
                 f.clips[idx].title = title
             }
-            LearningStore.save(folders)
+            LearningStore.save(root)
         }
     }
 
     private func append(_ clip: LearningClip) {
-        LearningStore.mutate(at: path, in: &folders) { $0.clips.append(clip) }
-        LearningStore.save(folders)
+        LearningStore.mutate(at: path, in: &root) { $0.clips.append(clip) }
+        LearningStore.save(root)
+    }
+
+    private func renameClip(_ clip: LearningClip, to newTitle: String) {
+        LearningStore.mutate(at: path, in: &root) { f in
+            guard let idx = f.clips.firstIndex(where: { $0.id == clip.id }) else { return }
+            f.clips[idx].title = newTitle
+        }
+        LearningStore.save(root)
     }
 
     private func deleteClips(_ offsets: IndexSet) {
         let removed = offsets.map { clips[$0] }
-        LearningStore.mutate(at: path, in: &folders) { f in
+        LearningStore.mutate(at: path, in: &root) { f in
             f.clips.removeAll { c in removed.contains { $0.id == c.id } }
         }
         for clip in removed { LearningStore.deleteMedia(for: clip) }
-        LearningStore.save(folders)
+        LearningStore.save(root)
     }
 
     private func moveClips(from source: IndexSet, to destination: Int) {
-        LearningStore.mutate(at: path, in: &folders) { $0.clips.move(fromOffsets: source, toOffset: destination) }
-        LearningStore.save(folders)
+        LearningStore.mutate(at: path, in: &root) { $0.clips.move(fromOffsets: source, toOffset: destination) }
+        LearningStore.save(root)
     }
 }
 
@@ -528,9 +452,19 @@ private struct LearningFolderView: View {
 
 private struct ClipPreviewSheet: View {
     let clip: LearningClip
+    let onRename: (String) -> Void
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
     @State private var player: AVPlayer?
+    @State private var title: String
+    @State private var showRenameAlert = false
+    @State private var editedTitle = ""
+
+    init(clip: LearningClip, onRename: @escaping (String) -> Void) {
+        self.clip = clip
+        self.onRename = onRename
+        _title = State(initialValue: clip.title)
+    }
 
     var body: some View {
         NavigationStack {
@@ -579,11 +513,29 @@ private struct ClipPreviewSheet: View {
                     }
                 }
             }
-            .navigationTitle(clip.title)
+            .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        editedTitle = title
+                        showRenameAlert = true
+                    } label: {
+                        Image(systemName: "pencil")
+                    }
+                }
+            }
+            .alert("Edit Title", isPresented: $showRenameAlert) {
+                TextField("Title", text: $editedTitle)
+                Button("Cancel", role: .cancel) {}
+                Button("Save") {
+                    let trimmed = editedTitle.trimmingCharacters(in: .whitespaces)
+                    guard !trimmed.isEmpty else { return }
+                    title = trimmed
+                    onRename(trimmed)
                 }
             }
         }

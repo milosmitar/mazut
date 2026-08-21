@@ -71,28 +71,31 @@ nonisolated enum LearningStore {
         return dir
     }
 
-    static func load() -> [LearningFolder] {
+    /// The id of the implicit top-level folder — never shown as a row, just the
+    /// container for whatever lives at the root of the Learning tab.
+    static let rootID = "root"
+
+    static func load() -> LearningFolder {
         guard let data = try? Data(contentsOf: indexURL),
-              let folders = try? JSONDecoder().decode([LearningFolder].self, from: data)
-        else { return [] }
-        return folders
+              let root = try? JSONDecoder().decode(LearningFolder.self, from: data)
+        else { return LearningFolder(id: rootID, name: "Learning") }
+        return root
     }
 
-    static func save(_ folders: [LearningFolder]) {
-        if let data = try? JSONEncoder().encode(folders) {
+    static func save(_ root: LearningFolder) {
+        if let data = try? JSONEncoder().encode(root) {
             try? data.write(to: indexURL)
         }
     }
 
     // MARK: - Folder tree navigation
 
-    /// Walk `path` (a list of folder IDs from a root folder down to, and including,
-    /// the target) and return that folder, or nil if the path no longer resolves
-    /// (e.g. an ancestor was deleted elsewhere).
-    static func folder(at path: [String], in folders: [LearningFolder]) -> LearningFolder? {
-        guard let first = path.first, var current = folders.first(where: { $0.id == first })
-        else { return nil }
-        for id in path.dropFirst() {
+    /// Walk `path` (a list of subfolder IDs starting from `root`; empty = the
+    /// root itself) and return that folder, or nil if the path no longer
+    /// resolves (e.g. an ancestor was deleted elsewhere).
+    static func folder(at path: [String], in root: LearningFolder) -> LearningFolder? {
+        var current = root
+        for id in path {
             guard let next = current.subfolders.first(where: { $0.id == id }) else { return nil }
             current = next
         }
@@ -100,15 +103,11 @@ nonisolated enum LearningStore {
     }
 
     /// Mutate the folder at `path` in place, then let the caller persist the result.
-    static func mutate(at path: [String], in folders: inout [LearningFolder],
+    static func mutate(at path: [String], in root: inout LearningFolder,
                        _ body: (inout LearningFolder) -> Void) {
-        guard let first = path.first, let idx = folders.firstIndex(where: { $0.id == first })
-        else { return }
-        if path.count == 1 {
-            body(&folders[idx])
-        } else {
-            mutate(at: Array(path.dropFirst()), in: &folders[idx].subfolders, body)
-        }
+        guard let first = path.first else { body(&root); return }
+        guard let idx = root.subfolders.firstIndex(where: { $0.id == first }) else { return }
+        mutate(at: Array(path.dropFirst()), in: &root.subfolders[idx], body)
     }
 
     // MARK: - Media files
