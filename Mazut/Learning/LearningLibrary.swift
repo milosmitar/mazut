@@ -76,9 +76,18 @@ nonisolated enum LearningStore {
     static let rootID = "root"
 
     static func load() -> LearningFolder {
-        guard let data = try? Data(contentsOf: indexURL),
-              let root = try? JSONDecoder().decode(LearningFolder.self, from: data)
-        else { return LearningFolder(id: rootID, name: "Learning") }
+        guard let data = try? Data(contentsOf: indexURL) else {
+            return LearningFolder(id: rootID, name: "Learning")
+        }
+        guard let root = try? JSONDecoder().decode(LearningFolder.self, from: data) else {
+            // The file exists but doesn't match the current shape (e.g. an old
+            // format from before a schema change). Rather than silently falling
+            // back to empty and letting the next save() overwrite — and lose —
+            // it, move it aside so it can be recovered by hand if needed.
+            let backup = root.appendingPathComponent("folders-unreadable-\(Int(Date().timeIntervalSince1970)).json")
+            try? FileManager.default.moveItem(at: indexURL, to: backup)
+            return LearningFolder(id: rootID, name: "Learning")
+        }
         return root
     }
 

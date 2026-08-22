@@ -7,7 +7,7 @@
 //  extension; the shared model is in MazutWidget/StemActivityShared.swift.
 //
 
-#if canImport(ActivityKit)
+#if canImport(ActivityKit) && !targetEnvironment(macCatalyst)
 import ActivityKit
 
 @MainActor
@@ -50,7 +50,7 @@ final class StemActivityController {
 
 #else
 
-/// macOS and other platforms don't have ActivityKit — empty implementation.
+/// macOS and Mac Catalyst don't support Live Activities — empty implementation.
 @MainActor
 final class StemActivityController {
     func start(state: StemActivityAttributes.ContentState) {}

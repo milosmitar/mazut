@@ -7,11 +7,18 @@
 //  `StemKind.allCases` in the app: vocals, drums, bass, guitar, piano, other.
 //
 
-import ActivityKit
 import AppIntents
 import os.log
+#if canImport(ActivityKit)
+import ActivityKit
+#endif
 
-/// Attributes of the Live Activity card on the lock screen.
+/// Attributes of the Live Activity card on the lock screen. Live Activities
+/// don't exist on Mac Catalyst at all (the `ActivityAttributes` conformance
+/// itself is unavailable there, even though the module imports fine), so the
+/// `ContentState` shape — used unconditionally by `StemMixerEngine` — is kept
+/// as a plain type and the conformance is added only where it's actually usable.
+#if canImport(ActivityKit) && !targetEnvironment(macCatalyst)
 nonisolated struct StemActivityAttributes: ActivityAttributes {
     struct ContentState: Codable, Hashable {
         /// Whether a channel is audible, in the order of `StemChannel.allCases`.
@@ -20,6 +27,15 @@ nonisolated struct StemActivityAttributes: ActivityAttributes {
         var title: String
     }
 }
+#else
+nonisolated struct StemActivityAttributes {
+    struct ContentState: Codable, Hashable {
+        var audible: [Bool]
+        var isPlaying: Bool
+        var title: String
+    }
+}
+#endif
 
 /// Channels (stems) — a copy of the order and names from `StemKind` because
 /// the widget extension can't see the rest of the app.
