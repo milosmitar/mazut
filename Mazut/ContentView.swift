@@ -3,6 +3,7 @@
 //  Mazut
 //
 
+import Charts
 import SwiftUI
 import UniformTypeIdentifiers
 #if canImport(UIKit)
@@ -67,6 +68,8 @@ struct ContentView: View {
     @State private var separator = DemucsSeparator()
     @State private var metronome = Metronome()
     @State private var timingCoach = TimingCoach()
+    /// Non-nil while the take summary sheet is up.
+    @State private var timingSummary: TimingCoach.Summary?
     @State private var tuner = Tuner()
     @State private var stems: [Stem] = StemKind.allCases.map { Stem(kind: $0) }
     @State private var showImporter = false
@@ -363,6 +366,9 @@ struct ContentView: View {
             }
             .navigationTitle("Metronome")
         }
+        .sheet(item: $timingSummary) { summary in
+            TimingSummarySheet(summary: summary)
+        }
     }
 
     private var metronomeContent: some View {
@@ -448,7 +454,7 @@ struct ContentView: View {
                         // known for sure now — the Listen button is gated on it.
                         timingCoach.refreshRoute()
                     } else {
-                        timingCoach.stop()
+                        stopListeningAndReport()
                     }
                 } label: {
                     Label(metronome.isRunning ? "Stop" : "Start",
@@ -478,7 +484,11 @@ struct ContentView: View {
     private var timingSection: some View {
         VStack(spacing: 10) {
             Button {
-                timingCoach.toggle(metronome: metronome)
+                if timingCoach.isListening {
+                    stopListeningAndReport()
+                } else {
+                    timingCoach.start(metronome: metronome)
+                }
             } label: {
                 Label(timingCoach.isListening ? "Stop listening" : "Check my timing",
                       systemImage: timingCoach.isListening ? "waveform" : "mic")
@@ -540,16 +550,9 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
 
-            // The last few notes, oldest on the left.
-            HStack(spacing: 5) {
-                ForEach(timingCoach.hits) { hit in
-                    Circle()
-                        .fill(hit.isOnTime ? Color.green : Color.orange)
-                        .frame(width: 7, height: 7)
-                }
-            }
-            .frame(height: 8)
-            .animation(.easeOut(duration: 0.15), value: timingCoach.hits.count)
+            TimingTapeChart(hits: timingCoach.hits)
+                .frame(height: 132)
+                .animation(.easeOut(duration: 0.15), value: timingCoach.hits.count)
 
             if let accuracy = timingCoach.accuracy, let offset = timingCoach.averageOffsetMs {
                 Text("\(Int((accuracy * 100).rounded()))% on the beat · \(tendencyText(offset))")
@@ -583,6 +586,15 @@ struct ContentView: View {
     private func tendencyText(_ ms: Double) -> String {
         guard abs(ms) > 8 else { return "steady" }
         return ms < 0 ? "rushing by \(Int(-ms.rounded())) ms" : "dragging by \(Int(ms.rounded())) ms"
+    }
+
+    /// Stop the timing check and show the take summary — but only when the user
+    /// ended it themselves and only if the take was long enough to say anything.
+    /// A stop from a tab change or an unplugged cable raises no sheet.
+    private func stopListeningAndReport() {
+        guard timingCoach.isListening else { return }
+        timingCoach.stop()
+        timingSummary = timingCoach.lastSummary
     }
 
     /// A groove other than `.basic` fixes its own bar length, so the time

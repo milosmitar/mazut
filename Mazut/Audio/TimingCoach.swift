@@ -26,15 +26,44 @@ final class TimingCoach {
     /// One detected note and how far it sat from the nearest grid step.
     struct Hit: Identifiable {
         let id = UUID()
+        /// Position in the take — the chart's x axis, so notes stay in order and
+        /// keep their spacing as the window scrolls.
+        let index: Int
         /// Positive = late (dragging), negative = early (rushing).
         let deviationMs: Double
         var isOnTime: Bool { abs(deviationMs) <= TimingCoach.toleranceMs }
     }
 
+    /// How a whole take went, built when listening stops. Kept separately from
+    /// `hits` because that is a rolling window — the score for a take has to
+    /// count every note, not the last 32.
+    struct Summary: Identifiable {
+        let id = UUID()
+        let notes: Int
+        let onTime: Int
+        /// Mean deviation: the systematic part, ahead of or behind the beat.
+        let averageMs: Double
+        /// Standard deviation: how consistent the playing was, apart from any
+        /// constant offset. A steady player who is always 30 ms late has a large
+        /// average and a small spread.
+        let spreadMs: Double
+        let earliestMs: Double
+        let latestMs: Double
+        /// The tail of the take, for the chart.
+        let tape: [Hit]
+
+        var accuracy: Double { notes > 0 ? Double(onTime) / Double(notes) : 0 }
+    }
+
     /// A note inside this window counts as on the beat.
     static let toleranceMs = 25.0
-    /// How many recent notes the score is computed over.
-    private static let historyLimit = 16
+    /// Below this a take is too short to say anything about.
+    private static let minimumNotesForSummary = 4
+    /// How many notes the chart keeps.
+    static let historyLimit = 32
+    /// How many of the most recent notes the score is computed over — shorter
+    /// than the chart, so the percentage reacts to what is being played now.
+    private static let scoreWindow = 16
 
     // MARK: Public state (observed by the UI)
 
@@ -47,15 +76,19 @@ final class TimingCoach {
     private(set) var hits: [Hit] = []
 
     var lastHit: Hit? { hits.last }
+    /// The notes the score is computed over.
+    private var scored: [Hit] { Array(hits.suffix(Self.scoreWindow)) }
     /// Share of recent notes inside the tolerance window (0…1), nil below 4 notes.
     var accuracy: Double? {
-        guard hits.count >= 4 else { return nil }
-        return Double(hits.filter(\.isOnTime).count) / Double(hits.count)
+        let recent = scored
+        guard recent.count >= 4 else { return nil }
+        return Double(recent.filter(\.isOnTime).count) / Double(recent.count)
     }
     /// Mean deviation — the systematic part: consistently ahead of or behind the beat.
     var averageOffsetMs: Double? {
-        guard hits.count >= 4 else { return nil }
-        return hits.map(\.deviationMs).reduce(0, +) / Double(hits.count)
+        let recent = scored
+        guard recent.count >= 4 else { return nil }
+        return recent.map(\.deviationMs).reduce(0, +) / Double(recent.count)
     }
 
     /// True when the output route is a built-in speaker, i.e. the microphone
@@ -75,6 +108,19 @@ final class TimingCoach {
     private(set) var detectedNotes = 0
     private(set) var gradedNotes = 0
     private(set) var inputSampleRate: Double = 0
+    /// Ever-increasing note counter — the chart's x position.
+    @ObservationIgnored private var noteIndex = 0
+
+    /// Summary of the take that just ended, or nil if it was too short.
+    private(set) var lastSummary: Summary?
+
+    // Running totals for the whole take (`hits` only keeps the last 32).
+    @ObservationIgnored private var takeCount = 0
+    @ObservationIgnored private var takeOnTime = 0
+    @ObservationIgnored private var takeSum = 0.0
+    @ObservationIgnored private var takeSumOfSquares = 0.0
+    @ObservationIgnored private var takeMin = 0.0
+    @ObservationIgnored private var takeMax = 0.0
 
     // MARK: Audio graph
 
@@ -127,6 +173,7 @@ final class TimingCoach {
     func stop() {
         startRequested = false   // cancels a start still waiting on the permission prompt
         guard isListening else { return }
+        lastSummary = makeSummary()   // before the take's totals are cleared
         isListening = false
         inputLevel = 0
         inputSampleRate = 0
@@ -201,8 +248,11 @@ final class TimingCoach {
         failure = nil
         inputSampleRate = rate
         hits.removeAll()
+        noteIndex = 0
         detectedNotes = 0
         gradedNotes = 0
+        lastSummary = nil
+        resetTake()
         isListening = true
         refreshRoute()
     }
@@ -264,8 +314,39 @@ final class TimingCoach {
         guard !hearsMetronomeOverSpeaker else { return }
         guard let deviation = metronome?.deviation(atHostTime: hostTime) else { return }
         gradedNotes += 1
-        hits.append(Hit(deviationMs: deviation * 1000))
+        let hit = Hit(index: noteIndex, deviationMs: deviation * 1000)
+        hits.append(hit)
+        noteIndex += 1
         if hits.count > Self.historyLimit { hits.removeFirst(hits.count - Self.historyLimit) }
+
+        let ms = hit.deviationMs
+        takeCount += 1
+        if hit.isOnTime { takeOnTime += 1 }
+        takeSum += ms
+        takeSumOfSquares += ms * ms
+        takeMin = takeCount == 1 ? ms : min(takeMin, ms)
+        takeMax = takeCount == 1 ? ms : max(takeMax, ms)
+    }
+
+    /// Freeze the take into a summary, or nil if too few notes were measured.
+    private func makeSummary() -> Summary? {
+        guard takeCount >= Self.minimumNotesForSummary else { return nil }
+        let mean = takeSum / Double(takeCount)
+        // Variance from the running sums; clamped because floating-point error
+        // can push a near-zero variance slightly negative.
+        let variance = max(0, takeSumOfSquares / Double(takeCount) - mean * mean)
+        return Summary(notes: takeCount, onTime: takeOnTime, averageMs: mean,
+                       spreadMs: variance.squareRoot(), earliestMs: takeMin,
+                       latestMs: takeMax, tape: hits)
+    }
+
+    private func resetTake() {
+        takeCount = 0
+        takeOnTime = 0
+        takeSum = 0
+        takeSumOfSquares = 0
+        takeMin = 0
+        takeMax = 0
     }
 
     // MARK: Session + clock
