@@ -443,7 +443,13 @@ struct ContentView: View {
                 // Start / Stop
                 Button {
                     metronome.toggle()
-                    if !metronome.isRunning { timingCoach.stop() }
+                    if metronome.isRunning {
+                        // Starting activates the session, so the route is only
+                        // known for sure now — the Listen button is gated on it.
+                        timingCoach.refreshRoute()
+                    } else {
+                        timingCoach.stop()
+                    }
                 } label: {
                     Label(metronome.isRunning ? "Stop" : "Start",
                           systemImage: metronome.isRunning ? "stop.fill" : "play.fill")
@@ -482,17 +488,31 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
             .tint(timingCoach.isListening ? .green : .accentColor)
-            .disabled(!metronome.isRunning)
+            // Measuring over the speaker is impossible, not merely inaccurate:
+            // the microphone hears the clicks. Say so on the button rather than
+            // letting it run and quietly grading nothing.
+            .disabled(!metronome.isRunning || timingCoach.hearsMetronomeOverSpeaker)
 
             if timingCoach.permissionDenied {
                 Text("Microphone access is off — turn it on in Settings › Mazut.")
                     .font(.caption)
                     .foregroundStyle(.red)
                     .multilineTextAlignment(.center)
+            } else if let failure = timingCoach.failure, !timingCoach.isListening {
+                Text(failure)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+            } else if timingCoach.hearsMetronomeOverSpeaker {
+                Label("Plug in headphones — over the speaker the microphone hears the metronome, not just you.",
+                      systemImage: "headphones")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
             } else if timingCoach.isListening {
                 timingReadout
             } else {
-                Text("Put headphones on: through the speaker the microphone hears the metronome itself, not just you.")
+                Text("Play along with the click and each note gets measured against it.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -502,13 +522,12 @@ struct ContentView: View {
 
     private var timingReadout: some View {
         VStack(spacing: 8) {
-            if timingCoach.hearsMetronomeOverSpeaker {
-                Label("Playing through the speaker — the reading counts the clicks too.",
-                      systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
-                    .multilineTextAlignment(.center)
-            }
+            // Input meter — shows the microphone is actually hearing something,
+            // so "no readings" can be told apart from "no signal".
+            ProgressView(value: Double(min(timingCoach.inputLevel * 3, 1)))
+                .progressViewStyle(.linear)
+                .tint(timingCoach.inputLevel > 0.01 ? .green : .gray)
+                .frame(maxWidth: 160)
 
             if let hit = timingCoach.lastHit {
                 Text(deviationText(hit.deviationMs))
@@ -537,7 +556,19 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            // Which stage is alive — notes heard vs. notes actually measured.
+            Text(timingStatusText)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
+    }
+
+    private var timingStatusText: String {
+        let rate = timingCoach.inputSampleRate > 0
+            ? "\(Int((timingCoach.inputSampleRate / 1000).rounded())) kHz"
+            : "no input"
+        return "mic \(rate) · notes \(timingCoach.detectedNotes) · measured \(timingCoach.gradedNotes)"
     }
 
     /// "+18 ms · late" — sign included, so early/late is readable at a glance.

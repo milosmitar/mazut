@@ -139,24 +139,89 @@ final class Metronome {
     /// the metronome must not switch the category back to `.playback` under it.
     var sessionOwnedExternally = false
 
+    /// Called when an engine rebuild dropped the microphone tap, so the coach can
+    /// stop instead of sitting green with no buffers arriving.
+    var onInputTapLost: (() -> Void)?
+    /// Kept so a rebuild can re-install the same tap instead of losing it.
+    private var currentTap: (size: AVAudioFrameCount, block: AVAudioNodeTapBlock)?
+    private var hasInputTap = false
+    private var inputTapSampleRate: Double = 0
+
     private(set) var isRunning = false
     /// Current beat (0-based) — for the visual indicator.
     private(set) var currentBeat = 0
 
     // MARK: - Audio graph
 
-    private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
+    // Rebuilt on every start rather than reused: see `rebuildAndStart(tap:)`.
+    private var engine = AVAudioEngine()
+    private var player = AVAudioPlayerNode()
     private let sampleRate: Double = 44_100
     private let format: AVAudioFormat
     /// Measure length in frames (for computing the current beat).
     private var measureFrames: AVAudioFramePosition = 0
     private var displayTimer: Timer?
+    /// Rate-limits the watchdog in `updateBeat()`.
+    private var lastWatchdogRestart = Date.distantPast
 
     init() {
         format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
+    }
+
+    /// Build a fresh engine for the session **as it is right now**, and start it.
+    ///
+    /// This is the one place the audio graph is created, and the ordering rule it
+    /// enforces is the whole lesson of this file: *set the session category first,
+    /// build the engine second.* An `AVAudioEngine` makes its connections against
+    /// the hardware format current at build time and holds on to it. An engine
+    /// built under `.playback` and merely stopped and restarted under
+    /// `.playAndRecord` renders into nothing — the click goes silent while
+    /// `isRunning` still claims it plays, and `player.playerTime(forNodeTime:)`
+    /// returns nil so the timing coach grades nothing either. Both symptoms, one
+    /// cause. Rebuilding costs a few milliseconds; reusing costs correctness.
+    ///
+    /// With `tap` set, the microphone is engaged before the output is connected
+    /// and `inputTapSampleRate` holds the rate the tap will deliver.
+    private func rebuildAndStart(tap: (size: AVAudioFrameCount, block: AVAudioNodeTapBlock)?) -> Bool {
+        // Never drop an engine with a live tap block still on its input node.
+        if hasInputTap { engine.inputNode.removeTap(onBus: 0) }
+        hasInputTap = false
+        player.stop()
+        engine.stop()
+        engine = AVAudioEngine()
+        player = AVAudioPlayerNode()
+
+        if let tap {
+            let input = engine.inputNode
+            // The tap has to use the node's *output* format; a mismatch throws
+            // inside installTap, which no `guard` here could catch.
+            let tapFormat = input.outputFormat(forBus: 0)
+            guard tapFormat.sampleRate > 0, tapFormat.channelCount > 0 else {
+                print("Metronome: no usable microphone input format")
+                return false
+            }
+            input.installTap(onBus: 0, bufferSize: tap.size, format: tapFormat, block: tap.block)
+            inputTapSampleRate = tapFormat.sampleRate
+        }
+
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: format)
+        engine.prepare()
+        do {
+            try engine.start()
+        } catch {
+            print("Metronome engine start error: \(error)")
+            if tap != nil { engine.inputNode.removeTap(onBus: 0) }
+            return false
+        }
+
+        hasInputTap = tap != nil
+        if isRunning {
+            scheduleLoop()
+            player.play()
+            currentBeat = 0
+        }
+        return true
     }
 
     // MARK: - Control
@@ -166,16 +231,11 @@ final class Metronome {
     func start() {
         guard !isRunning else { return }
         configureSession()
-        scheduleLoop()
-        do {
-            if !engine.isRunning { try engine.start() }
-        } catch {
-            print("Metronome start error: \(error)")
+        isRunning = true            // rebuildAndStart schedules and plays off this
+        guard rebuildAndStart(tap: nil) else {
+            isRunning = false
             return
         }
-        player.play()
-        isRunning = true
-        currentBeat = 0
         startDisplayTimer()
     }
 
@@ -196,20 +256,63 @@ final class Metronome {
     }
 
     /// Re-establish the graph after someone else changed the session category or
-    /// route (the timing coach switching to `.playAndRecord` and back).
+    /// route (the timing coach switching to `.playAndRecord` and back). Keeps the
+    /// microphone tap if one is installed.
     func restartIfRunning() {
         guard isRunning else { return }
-        player.stop()
-        engine.stop()
-        do {
-            try engine.start()
-        } catch {
-            print("Metronome restart error: \(error)")
+        let tap = currentTap
+        guard rebuildAndStart(tap: tap) else {
+            isRunning = false
+            stopDisplayTimer()
+            if tap != nil { reportInputTapLost() }
             return
         }
-        scheduleLoop()
-        player.play()
-        currentBeat = 0
+    }
+
+    // MARK: - Microphone tap (for the timing coach)
+
+    /// Attach a microphone tap to the click engine and return the input sample
+    /// rate, or `nil` if the input isn't usable.
+    ///
+    /// The tap deliberately lives on *this* engine. A second `AVAudioEngine` with
+    /// its own input node reconfigures the shared I/O unit when it starts, which
+    /// knocks this one out of its configuration: the click goes silent and
+    /// `player.lastRenderTime` turns nil, so timing can no longer be read either.
+    ///
+    /// The caller must have put the session into `.playAndRecord` first —
+    /// `inputNode` has no usable format under `.playback`.
+    func attachInputTap(bufferSize: AVAudioFrameCount, block: @escaping AVAudioNodeTapBlock) -> Double? {
+        let tap = (size: bufferSize, block: block)
+        guard rebuildAndStart(tap: tap) else {
+            currentTap = nil
+            // `isRunning` is left alone: the caller restores the session and calls
+            // `restartIfRunning()`, which brings the plain click back.
+            return nil
+        }
+        currentTap = tap
+        return inputTapSampleRate
+    }
+
+    /// Remove the microphone tap and release the input hardware. The caller puts
+    /// the session back to `.playback` and then calls `restartIfRunning()`, which
+    /// rebuilds the engine for that category.
+    func detachInputTap() {
+        currentTap = nil
+        if hasInputTap {
+            engine.inputNode.removeTap(onBus: 0)
+            hasInputTap = false   // deliberate removal — no "tap lost" callback
+        }
+        player.stop()
+        engine.stop()
+    }
+
+    /// The tap could not be carried over a rebuild — tell the coach rather than
+    /// leave it waiting for buffers that will never arrive. Asynchronously: the
+    /// handler tears the coach down, which calls straight back into this class.
+    private func reportInputTapLost() {
+        currentTap = nil
+        let notify = onInputTapLost
+        DispatchQueue.main.async { notify?() }
     }
 
     // MARK: - Grid (for the timing coach)
@@ -232,6 +335,9 @@ final class Metronome {
     /// output latency is taken out; the caller is expected to have already taken
     /// out the microphone's input latency.
     func deviation(atHostTime hostTime: UInt64) -> Double? {
+        // No host time on the render clock means there is nothing to measure
+        // against: "now" is not the render time — it is however long the onset
+        // spent hopping between queues — and would produce an invented number.
         guard isRunning, measureFrames > 0,
               let nodeTime = player.lastRenderTime, nodeTime.isHostTimeValid,
               let playerTime = player.playerTime(forNodeTime: nodeTime) else { return nil }
@@ -403,6 +509,19 @@ final class Metronome {
     }
 
     private func updateBeat() {
+        // Watchdog. A session or route change can leave the player stopped while
+        // the UI still shows a red Stop button — silence that nothing recovers
+        // from. Restart rather than sit there lying about it.
+        //
+        // Not while the coach is listening: a restart resets the player's sample
+        // time, which moves the very grid `deviation(atHostTime:)` measures
+        // against. The coach's own teardown covers failures during that window.
+        if isRunning, !hasInputTap, !player.isPlaying,
+           Date().timeIntervalSince(lastWatchdogRestart) > 0.5 {
+            lastWatchdogRestart = Date()
+            restartIfRunning()
+            return
+        }
         let beats = activeBeatsPerMeasure
         guard measureFrames > 0, beats > 0,
               let nodeTime = player.lastRenderTime,
