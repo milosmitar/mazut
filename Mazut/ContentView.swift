@@ -380,11 +380,11 @@ struct ContentView: View {
 
                 // Beat indicator
                 HStack(spacing: 14) {
-                    ForEach(0..<metronome.beatsPerMeasure, id: \.self) { i in
+                    ForEach(0..<metronome.activeBeatsPerMeasure, id: \.self) { i in
                         Circle()
                             .fill(beatColor(i))
                             .frame(width: 18, height: 18)
-                            .scaleEffect(metronome.beatsPerMeasure > 1
+                            .scaleEffect(metronome.activeBeatsPerMeasure > 1
                                          && metronome.isRunning && i == metronome.currentBeat ? 1.35 : 1)
                             .animation(.easeOut(duration: 0.08), value: metronome.currentBeat)
                     }
@@ -410,14 +410,32 @@ struct ContentView: View {
                 .buttonStyle(.plain)
                 .padding(.horizontal)
 
-                // Time signature (number of beats)
+                // Time signature (number of beats) — a fixed groove brings its own.
                 Picker("Time signature", selection: $metronome.beatsPerMeasure) {
                     ForEach([1, 2, 3, 4, 6], id: \.self) { n in
                         Text(n == 1 ? "1/1" : "\(n)/4").tag(n)
                     }
                 }
                 .pickerStyle(.segmented)
+                .disabled(grooveOverridesTimeSignature)
+                .opacity(grooveOverridesTimeSignature ? 0.4 : 1)
                 .padding(.horizontal)
+
+                // Sound: synthetic click or drum kit (kick on the accent, hi-hat elsewhere)
+                Picker("Sound", selection: $metronome.sound) {
+                    ForEach(MetronomeSound.allCases) { s in
+                        Label(s.label, systemImage: s.symbol).tag(s)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .padding(.horizontal)
+
+                // Groove — only meaningful for the drum kit.
+                if metronome.sound == .drums {
+                    groovePicker
+                        .padding(.horizontal)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
 
                 // Start / Stop
                 Button {
@@ -436,12 +454,48 @@ struct ContentView: View {
                 Spacer()
         }
         .padding()
+        .animation(.easeInOut(duration: 0.2), value: metronome.sound)
+    }
+
+    /// A groove other than `.basic` fixes its own bar length, so the time
+    /// signature picker has nothing to say while one is selected.
+    private var grooveOverridesTimeSignature: Bool {
+        metronome.sound == .drums && metronome.groove.beats != nil
+    }
+
+    /// Horizontal chips of drum grooves. `Basic` follows the time signature
+    /// picker; the others show the bar length they bring with them.
+    private var groovePicker: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(DrumGroove.allCases) { g in
+                    let selected = metronome.groove == g
+                    let beats = g.beats ?? metronome.beatsPerMeasure
+                    Button {
+                        metronome.groove = g
+                    } label: {
+                        VStack(spacing: 1) {
+                            Text(g.label).font(.subheadline.weight(.medium))
+                            Text(beats == 1 ? "1/1" : "\(beats)/4")
+                                .font(.caption2)
+                                .foregroundStyle(selected ? Color.white.opacity(0.8) : Color.secondary)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .background(Capsule().fill(selected ? Color.accentColor : Color.gray.opacity(0.18)))
+                        .foregroundStyle(selected ? Color.white : Color.primary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 2)
+        }
     }
 
     /// Beat dot color: the active beat lights up (first one red, others accent).
     /// In 1/1 the color doesn't change per beat — it stays constant while running.
     private func beatColor(_ i: Int) -> Color {
-        if metronome.beatsPerMeasure == 1 {
+        if metronome.activeBeatsPerMeasure == 1 {
             return metronome.isRunning ? .accentColor : Color.gray.opacity(0.3)
         }
         if metronome.isRunning && i == metronome.currentBeat {
@@ -958,7 +1012,7 @@ struct ContentView: View {
 
     private var metronomeDotColor: Color {
         guard metronome.isRunning else { return Color.gray.opacity(0.3) }
-        if metronome.beatsPerMeasure > 1 && metronome.currentBeat == 0 { return .red }
+        if metronome.activeBeatsPerMeasure > 1 && metronome.currentBeat == 0 { return .red }
         return .accentColor
     }
 
