@@ -135,6 +135,10 @@ final class Metronome {
         return beatsPerMeasure
     }
 
+    /// Set by `TimingCoach` while it owns the audio session (`.playAndRecord`) —
+    /// the metronome must not switch the category back to `.playback` under it.
+    var sessionOwnedExternally = false
+
     private(set) var isRunning = false
     /// Current beat (0-based) — for the visual indicator.
     private(set) var currentBeat = 0
@@ -189,6 +193,63 @@ final class Metronome {
         player.stop()
         scheduleLoop()
         player.play()
+    }
+
+    /// Re-establish the graph after someone else changed the session category or
+    /// route (the timing coach switching to `.playAndRecord` and back).
+    func restartIfRunning() {
+        guard isRunning else { return }
+        player.stop()
+        engine.stop()
+        do {
+            try engine.start()
+        } catch {
+            print("Metronome restart error: \(error)")
+            return
+        }
+        scheduleLoop()
+        player.play()
+        currentBeat = 0
+    }
+
+    // MARK: - Grid (for the timing coach)
+
+    /// The grid a played note is judged against. A groove uses its own step
+    /// resolution; everything else uses 8th notes, so playing between the clicks
+    /// isn't reported as being half a beat late.
+    var gridStepsPerMeasure: Int {
+        var subdivision = 2
+        if sound == .drums, let pattern = groove.pattern {
+            subdivision = max(pattern.stepsPerBeat, 2)
+        }
+        return activeBeatsPerMeasure * subdivision
+    }
+
+    /// How far a note played at `hostTime` sits from the nearest grid step, in
+    /// seconds (positive = late). `nil` while the metronome is stopped.
+    ///
+    /// The comparison happens on the timeline the player *hears*, so the click's
+    /// output latency is taken out; the caller is expected to have already taken
+    /// out the microphone's input latency.
+    func deviation(atHostTime hostTime: UInt64) -> Double? {
+        guard isRunning, measureFrames > 0,
+              let nodeTime = player.lastRenderTime, nodeTime.isHostTimeValid,
+              let playerTime = player.playerTime(forNodeTime: nodeTime) else { return nil }
+        let elapsed = AVAudioTime.seconds(forHostTime: hostTime)
+            - AVAudioTime.seconds(forHostTime: nodeTime.hostTime)
+        let position = Double(playerTime.sampleTime) / sampleRate + elapsed - outputLatency
+        let step = Double(measureFrames) / sampleRate / Double(gridStepsPerMeasure)
+        guard step > 0 else { return nil }
+        // Distance to the nearest step, so the result lands in ±step/2.
+        return position - (position / step).rounded() * step
+    }
+
+    private var outputLatency: Double {
+        #if os(iOS)
+        AVAudioSession.sharedInstance().outputLatency
+        #else
+        0
+        #endif
     }
 
     // MARK: - Measure buffer
@@ -353,6 +414,7 @@ final class Metronome {
     }
 
     private func configureSession() {
+        guard !sessionOwnedExternally else { return }   // the coach needs .playAndRecord
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .default)

@@ -66,6 +66,7 @@ struct ContentView: View {
     @State private var engine = StemMixerEngine.shared
     @State private var separator = DemucsSeparator()
     @State private var metronome = Metronome()
+    @State private var timingCoach = TimingCoach()
     @State private var tuner = Tuner()
     @State private var stems: [Stem] = StemKind.allCases.map { Stem(kind: $0) }
     @State private var showImporter = false
@@ -161,8 +162,9 @@ struct ContentView: View {
         // unreadable against it otherwise.
         .preferredColorScheme(.dark)
         .onChange(of: selectedTab) { _, newValue in
-            // The tuner only records while its tab is open.
+            // The tuner and the timing coach only record while their tab is open.
             if newValue != 4 { tuner.stop() }
+            if newValue != 2 { timingCoach.stop() }
         }
     }
 
@@ -364,9 +366,10 @@ struct ContentView: View {
     }
 
     private var metronomeContent: some View {
-        VStack(spacing: 28) {
-                Spacer()
-
+        // Scrolls: with the drum grooves and the timing check the column no
+        // longer fits on a small phone.
+        ScrollView {
+            VStack(spacing: 22) {
                 // Tempo
                 VStack(spacing: 2) {
                     Text("\(metronome.bpm)")
@@ -440,6 +443,7 @@ struct ContentView: View {
                 // Start / Stop
                 Button {
                     metronome.toggle()
+                    if !metronome.isRunning { timingCoach.stop() }
                 } label: {
                     Label(metronome.isRunning ? "Stop" : "Start",
                           systemImage: metronome.isRunning ? "stop.fill" : "play.fill")
@@ -451,10 +455,103 @@ struct ContentView: View {
                 .tint(metronome.isRunning ? .red : .accentColor)
                 .padding(.horizontal)
 
-                Spacer()
+                timingSection
+                    .padding(.horizontal)
+            }
+            .padding()
         }
-        .padding()
+        .scrollBounceBehavior(.basedOnSize)
         .animation(.easeInOut(duration: 0.2), value: metronome.sound)
+        .animation(.easeInOut(duration: 0.2), value: timingCoach.isListening)
+    }
+
+    // MARK: - Timing check (microphone)
+
+    /// Grades what you play against the click grid. Headphones only — over the
+    /// speaker the microphone hears the metronome and would grade its own click.
+    private var timingSection: some View {
+        VStack(spacing: 10) {
+            Button {
+                timingCoach.toggle(metronome: metronome)
+            } label: {
+                Label(timingCoach.isListening ? "Stop listening" : "Check my timing",
+                      systemImage: timingCoach.isListening ? "waveform" : "mic")
+                    .font(.subheadline.bold())
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+            }
+            .buttonStyle(.bordered)
+            .tint(timingCoach.isListening ? .green : .accentColor)
+            .disabled(!metronome.isRunning)
+
+            if timingCoach.permissionDenied {
+                Text("Microphone access is off — turn it on in Settings › Mazut.")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+            } else if timingCoach.isListening {
+                timingReadout
+            } else {
+                Text("Put headphones on: through the speaker the microphone hears the metronome itself, not just you.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+        }
+    }
+
+    private var timingReadout: some View {
+        VStack(spacing: 8) {
+            if timingCoach.hearsMetronomeOverSpeaker {
+                Label("Playing through the speaker — the reading counts the clicks too.",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
+            }
+
+            if let hit = timingCoach.lastHit {
+                Text(deviationText(hit.deviationMs))
+                    .font(.title3.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(hit.isOnTime ? Color.green : Color.orange)
+                    .contentTransition(.numericText())
+            } else {
+                Text("Play along…")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+
+            // The last few notes, oldest on the left.
+            HStack(spacing: 5) {
+                ForEach(timingCoach.hits) { hit in
+                    Circle()
+                        .fill(hit.isOnTime ? Color.green : Color.orange)
+                        .frame(width: 7, height: 7)
+                }
+            }
+            .frame(height: 8)
+            .animation(.easeOut(duration: 0.15), value: timingCoach.hits.count)
+
+            if let accuracy = timingCoach.accuracy, let offset = timingCoach.averageOffsetMs {
+                Text("\(Int((accuracy * 100).rounded()))% on the beat · \(tendencyText(offset))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// "+18 ms · late" — sign included, so early/late is readable at a glance.
+    private func deviationText(_ ms: Double) -> String {
+        let value = Int(ms.rounded())
+        let signed = value > 0 ? "+\(value)" : "\(value)"
+        if abs(ms) <= TimingCoach.toleranceMs { return "\(signed) ms · on time" }
+        return "\(signed) ms · \(value < 0 ? "early" : "late")"
+    }
+
+    /// The systematic part of the error, averaged over the recent notes.
+    private func tendencyText(_ ms: Double) -> String {
+        guard abs(ms) > 8 else { return "steady" }
+        return ms < 0 ? "rushing by \(Int(-ms.rounded())) ms" : "dragging by \(Int(ms.rounded())) ms"
     }
 
     /// A groove other than `.basic` fixes its own bar length, so the time
