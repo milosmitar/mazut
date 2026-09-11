@@ -55,6 +55,10 @@ final class TimingCoach {
         var accuracy: Double { notes > 0 ? Double(onTime) / Double(notes) : 0 }
     }
 
+    /// Why listening ended. Only a take the user ended themselves earns a
+    /// verdict; everything else is an interruption.
+    enum StopReason { case user, interrupted }
+
     /// A note inside this window counts as on the beat.
     static let toleranceMs = 25.0
     /// Below this a take is too short to say anything about.
@@ -78,6 +82,10 @@ final class TimingCoach {
     var lastHit: Hit? { hits.last }
     /// The notes the score is computed over.
     private var scored: [Hit] { Array(hits.suffix(Self.scoreWindow)) }
+    /// How many notes that is. The live percentage counts this window while the
+    /// summary counts the whole take, so the UI has to name what it is scoring —
+    /// otherwise a take that started badly reads 94% live and 61% one frame later.
+    var scoredCount: Int { min(hits.count, Self.scoreWindow) }
     /// Share of recent notes inside the tolerance window (0…1), nil below 4 notes.
     var accuracy: Double? {
         let recent = scored
@@ -106,16 +114,12 @@ final class TimingCoach {
     /// no notes at all = the microphone or the thresholds; notes but nothing
     /// graded = the click track can't be read.
     private(set) var detectedNotes = 0
+    /// Notes measured against the grid. Doubles as the take's note count and as
+    /// the next note's x position on the chart — they are the same number.
     private(set) var gradedNotes = 0
     private(set) var inputSampleRate: Double = 0
-    /// Ever-increasing note counter — the chart's x position.
-    @ObservationIgnored private var noteIndex = 0
-
-    /// Summary of the take that just ended, or nil if it was too short.
-    private(set) var lastSummary: Summary?
 
     // Running totals for the whole take (`hits` only keeps the last 32).
-    @ObservationIgnored private var takeCount = 0
     @ObservationIgnored private var takeOnTime = 0
     @ObservationIgnored private var takeSum = 0.0
     @ObservationIgnored private var takeSumOfSquares = 0.0
@@ -152,8 +156,6 @@ final class TimingCoach {
 
     // MARK: Control
 
-    func toggle(metronome: Metronome) { isListening ? stop() : start(metronome: metronome) }
-
     func start(metronome: Metronome) {
         guard !isListening else { return }
         self.metronome = metronome
@@ -170,11 +172,17 @@ final class TimingCoach {
         }
     }
 
-    func stop() {
+    /// Stop listening, returning the take's summary when the user ended it and
+    /// enough notes were measured — nil for every other reason. The rule lives
+    /// here rather than at the call site: `stop()` runs on four paths (button,
+    /// tab change, unplugged headphones, lost tap) and only one of them is a
+    /// finished take.
+    @discardableResult
+    func stop(reason: StopReason = .interrupted) -> Summary? {
         startRequested = false   // cancels a start still waiting on the permission prompt
-        guard isListening else { return }
-        lastSummary = makeSummary()   // before the take's totals are cleared
-        isListening = false
+        guard isListening else { return nil }
+        let summary = reason == .user ? makeSummary() : nil
+        isListening = false   // stops grading notes still in flight on the analysis queue
         inputLevel = 0
         inputSampleRate = 0
         metronome?.onInputTapLost = nil
@@ -182,9 +190,8 @@ final class TimingCoach {
         // Hand the session back: the metronome sets its own category again.
         metronome?.sessionOwnedExternally = false
         restoreSession()
+        return summary
     }
-
-    func reset() { hits.removeAll() }
 
     private func beginCapture() {
         // The permission prompt is async: by the time it resolves the metronome
@@ -248,10 +255,7 @@ final class TimingCoach {
         failure = nil
         inputSampleRate = rate
         hits.removeAll()
-        noteIndex = 0
         detectedNotes = 0
-        gradedNotes = 0
-        lastSummary = nil
         resetTake()
         isListening = true
         refreshRoute()
@@ -272,10 +276,14 @@ final class TimingCoach {
         ) { [weak self] note in
             guard let self else { return }
             self.refreshRoute()
+            guard self.isListening else { return }
             let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
-            guard self.isListening, let raw,
-                  AVAudioSession.RouteChangeReason(rawValue: raw) == .oldDeviceUnavailable
-            else { return }
+            let deviceGone = raw.flatMap(AVAudioSession.RouteChangeReason.init(rawValue:)) == .oldDeviceUnavailable
+            // Two ways a take stops being measurable: the headphones went away,
+            // or the sound moved to the speaker (AirPlay, Control Center), where
+            // `register` grades nothing because the microphone hears the click.
+            // Both would otherwise leave the button green over a dead grader.
+            guard deviceGone || self.hearsMetronomeOverSpeaker else { return }
             self.stop()
         }
         #endif
@@ -307,41 +315,43 @@ final class TimingCoach {
 
     /// Grade one detected note against the metronome grid.
     private func register(hostTime: UInt64) {
+        // Onsets reach this hop by hop (analysis queue → main actor), so a note
+        // detected just before the stop arrives after it. Grading it would leave
+        // the take one or two notes past the summary the user is already reading.
+        guard isListening else { return }
         detectedNotes += 1
         // Over the speaker every "note" is really the metronome's own click,
         // landing on the beat by construction. Grading those would report a
         // flawless performance to someone who played nothing at all.
         guard !hearsMetronomeOverSpeaker else { return }
         guard let deviation = metronome?.deviation(atHostTime: hostTime) else { return }
-        gradedNotes += 1
-        let hit = Hit(index: noteIndex, deviationMs: deviation * 1000)
+        let hit = Hit(index: gradedNotes, deviationMs: deviation * 1000)
         hits.append(hit)
-        noteIndex += 1
         if hits.count > Self.historyLimit { hits.removeFirst(hits.count - Self.historyLimit) }
 
         let ms = hit.deviationMs
-        takeCount += 1
+        takeMin = gradedNotes == 0 ? ms : min(takeMin, ms)
+        takeMax = gradedNotes == 0 ? ms : max(takeMax, ms)
+        gradedNotes += 1
         if hit.isOnTime { takeOnTime += 1 }
         takeSum += ms
         takeSumOfSquares += ms * ms
-        takeMin = takeCount == 1 ? ms : min(takeMin, ms)
-        takeMax = takeCount == 1 ? ms : max(takeMax, ms)
     }
 
     /// Freeze the take into a summary, or nil if too few notes were measured.
     private func makeSummary() -> Summary? {
-        guard takeCount >= Self.minimumNotesForSummary else { return nil }
-        let mean = takeSum / Double(takeCount)
+        guard gradedNotes >= Self.minimumNotesForSummary else { return nil }
+        let mean = takeSum / Double(gradedNotes)
         // Variance from the running sums; clamped because floating-point error
         // can push a near-zero variance slightly negative.
-        let variance = max(0, takeSumOfSquares / Double(takeCount) - mean * mean)
-        return Summary(notes: takeCount, onTime: takeOnTime, averageMs: mean,
+        let variance = max(0, takeSumOfSquares / Double(gradedNotes) - mean * mean)
+        return Summary(notes: gradedNotes, onTime: takeOnTime, averageMs: mean,
                        spreadMs: variance.squareRoot(), earliestMs: takeMin,
                        latestMs: takeMax, tape: hits)
     }
 
     private func resetTake() {
-        takeCount = 0
+        gradedNotes = 0
         takeOnTime = 0
         takeSum = 0
         takeSumOfSquares = 0

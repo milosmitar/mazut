@@ -2,107 +2,12 @@
 //  TimingSummarySheet.swift
 //  Mazut
 //
-//  The timing tape chart, and the take summary shown when a timing check ends.
-//
-//  Both live in one file because the summary is mostly the same picture as the
-//  live readout, held still: the same tape, plus the numbers that only make
-//  sense once the take is over (score over every note, not the rolling window).
+//  Shown when a timing check ends: the tape held still, plus the numbers that
+//  only make sense once the take is over — the score counts every note of the
+//  take, not the live rolling window.
 //
 
-import Charts
 import SwiftUI
-
-// MARK: - Tape chart
-
-/// One point per played note, left to right; height is how far it sat from the
-/// beat. Above the zero line the note was late, below it early, and the shaded
-/// band is the tolerance window.
-///
-/// Colour carries only in/out of tolerance — the direction is read off the
-/// labelled axis, so it never depends on telling green from orange.
-struct TimingTapeChart: View {
-    let hits: [TimingCoach.Hit]
-    /// Notes visible before the tape starts scrolling.
-    var window = 24
-
-    var body: some View {
-        let bound = yBound
-        let last = hits.last?.index ?? 0
-        let firstX = Double(max(0, last - window + 1))
-        let lastX = Double(max(window - 1, last))
-
-        Chart {
-            RectangleMark(
-                yStart: .value("Tolerance low", -TimingCoach.toleranceMs),
-                yEnd: .value("Tolerance high", TimingCoach.toleranceMs)
-            )
-            .foregroundStyle(Color.green.opacity(0.12))
-
-            RuleMark(y: .value("On the beat", 0))
-                .lineStyle(StrokeStyle(lineWidth: 1))
-                // `Color.primary`, not the bare `.primary` shape style: inside a
-                // Chart the latter resolves to the default *series* colour, so
-                // the ink lines come out blue.
-                .foregroundStyle(Color.primary.opacity(0.35))
-
-            ForEach(hits) { hit in
-                LineMark(
-                    x: .value("Note", Double(hit.index)),
-                    y: .value("Deviation", hit.deviationMs)
-                )
-                .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))
-                .foregroundStyle(Color.primary.opacity(0.55))
-                // The smoothest of the options — monotone flattens the curve at
-                // each point and cardinal turns the peaks into near-corners. It
-                // can overshoot slightly between notes, which is fine here: the
-                // line is the trend, the points on top of it are the measurements.
-                .interpolationMethod(.catmullRom)
-            }
-
-            ForEach(hits) { hit in
-                PointMark(
-                    x: .value("Note", Double(hit.index)),
-                    y: .value("Deviation", hit.deviationMs)
-                )
-                .symbolSize(56)
-                .foregroundStyle(hit.isOnTime ? Color.green : Color.orange)
-            }
-        }
-        .chartLegend(.hidden)
-        // Half a step of padding on each side, or the newest note is drawn
-        // half-clipped by the plot edge.
-        .chartXScale(domain: (firstX - 0.5)...(lastX + 0.5))
-        .chartYScale(domain: -bound...bound)
-        .chartXAxis(.hidden)
-        .chartYAxis {
-            // Three labels only — the two edges name the direction so up/down is
-            // never a guess, and the middle marks the beat itself.
-            AxisMarks(position: .leading, values: [-bound, 0, bound]) { value in
-                AxisValueLabel {
-                    Text(Self.axisLabel(value.as(Double.self) ?? 0))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
-        }
-        .chartPlotStyle { plot in
-            plot.background(Color.primary.opacity(0.05))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-        }
-    }
-
-    /// Symmetric range, rounded up to a readable step and never tighter than
-    /// ±60 ms, so small errors don't get magnified into alarming swings.
-    private var yBound: Double {
-        let peak = hits.map { abs($0.deviationMs) }.max() ?? 0
-        return max(60, (peak / 20).rounded(.up) * 20)
-    }
-
-    static func axisLabel(_ value: Double) -> String {
-        if value == 0 { return "beat" }
-        return value > 0 ? "+\(Int(value)) late" : "−\(Int(abs(value))) early"
-    }
-}
 
 // MARK: - Summary sheet
 
@@ -116,7 +21,11 @@ struct TimingSummarySheet: View {
             ScrollView {
                 VStack(spacing: 24) {
                     score
-                    TimingTapeChart(hits: summary.tape)
+                    // The live chart scrolls, keeping the newest `window` notes
+                    // in the x domain; here the tape is static, so the window
+                    // has to be the whole tape or the oldest notes fall outside
+                    // the domain and are silently not drawn.
+                    TimingTapeChart(hits: summary.tape, window: max(1, summary.tape.count))
                         .frame(height: 150)
                     stats
                 }

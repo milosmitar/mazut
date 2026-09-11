@@ -3,7 +3,6 @@
 //  Mazut
 //
 
-import Charts
 import SwiftUI
 import UniformTypeIdentifiers
 #if canImport(UIKit)
@@ -552,10 +551,12 @@ struct ContentView: View {
 
             TimingTapeChart(hits: timingCoach.hits)
                 .frame(height: 132)
-                .animation(.easeOut(duration: 0.15), value: timingCoach.hits.count)
+                // Not `hits.count`: it stops changing once the tape is full, so
+                // the animation would die exactly when scrolling begins.
+                .animation(.easeOut(duration: 0.15), value: timingCoach.hits.last?.index)
 
             if let accuracy = timingCoach.accuracy, let offset = timingCoach.averageOffsetMs {
-                Text("\(Int((accuracy * 100).rounded()))% on the beat · \(tendencyText(offset))")
+                Text("\(Int((accuracy * 100).rounded()))% of the last \(timingCoach.scoredCount) on the beat · \(tendencyText(offset))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -592,9 +593,7 @@ struct ContentView: View {
     /// ended it themselves and only if the take was long enough to say anything.
     /// A stop from a tab change or an unplugged cable raises no sheet.
     private func stopListeningAndReport() {
-        guard timingCoach.isListening else { return }
-        timingCoach.stop()
-        timingSummary = timingCoach.lastSummary
+        timingSummary = timingCoach.stop(reason: .user)
     }
 
     /// A groove other than `.basic` fixes its own bar length, so the time
