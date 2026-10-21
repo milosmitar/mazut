@@ -118,3 +118,39 @@ struct TimingSummarySheet: View {
         return ms < 0 ? "rushing \(Int(-ms.rounded())) ms" : "dragging \(Int(ms.rounded())) ms"
     }
 }
+
+// MARK: - Previews
+
+private extension TimingCoach.Summary {
+    /// A take built from deviations alone, so a preview reads like real playing
+    /// rather than like numbers picked to fill the fields.
+    static func preview(_ ms: [Double], overSpeaker: Bool = false) -> TimingCoach.Summary {
+        let mean = ms.reduce(0, +) / Double(ms.count)
+        let variance = ms.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(ms.count)
+        return TimingCoach.Summary(
+            notes: ms.count,
+            onTime: ms.filter { abs($0) <= TimingCoach.toleranceMs }.count,
+            averageMs: mean,
+            spreadMs: variance.squareRoot(),
+            earliestMs: ms.min() ?? 0,
+            latestMs: ms.max() ?? 0,
+            tape: ms.enumerated().map { TimingCoach.Hit(index: $0.offset, deviationMs: $0.element) },
+            overSpeaker: overSpeaker)
+    }
+}
+
+#Preview("Getting there") {
+    TimingSummarySheet(summary: .preview(
+        [-48, 12, -31, 5, 18, -9, 22, 41, 35, 52, 44, 28, 16, 31, 9, -14, 20, 33]))
+}
+
+#Preview("Locked in") {
+    TimingSummarySheet(summary: .preview([3, -6, 1, 9, -4, 12, 2, -8, 5, 7, -2, 11]))
+}
+
+// Dragging hard but evenly: a large average with a small spread is a different
+// problem from a small average with a large one, and the sheet has to show that.
+#Preview("Dragging, but steady") {
+    TimingSummarySheet(summary: .preview(
+        [38, 44, 41, 36, 47, 39, 43, 40, 45, 37, 42, 46], overSpeaker: true))
+}

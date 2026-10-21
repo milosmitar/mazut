@@ -142,8 +142,6 @@ final class Metronome {
 
     /// One beat in seconds at the current tempo.
     var beatSeconds: Double { 60.0 / Double(bpm) }
-    /// One measure in seconds at the current tempo.
-    var measureSeconds: Double { Double(activeBeatsPerMeasure) * beatSeconds }
 
     /// Set by `TimingCoach` while it owns the audio session (`.playAndRecord`) —
     /// the metronome must not switch the category back to `.playback` under it.
@@ -500,10 +498,14 @@ final class Metronome {
     /// Everything audible is unchanged — pitch, level and the 8 ms decay — so the
     /// click sounds the same whether or not anything is listening.
     ///
-    /// The rise sits *before* the beat so the envelope peaks on it. A click peaking
-    /// 2 ms after its grid position would have the player locking on to what they
-    /// hear while being graded against the grid, and the whole take would read as
-    /// 2 ms early.
+    /// The rise is *not* shifted to sit before the beat, though that would put the
+    /// envelope's peak exactly on it. Shifting writes the downbeat's rise past the
+    /// loop point, to the end of the buffer — fine once the loop comes round, but
+    /// the first pass after `play()` starts at frame 0 and renders that first click
+    /// with no rise at all: the step attack this ramp exists to remove, on every
+    /// start. The ramp is load-bearing and the 2 ms is not. It leaves the audible
+    /// beat 2 ms after the grid, an order below the tolerance window and two orders
+    /// below the acoustic latency nothing compensates for anyway.
     private func renderClick(_ out: UnsafeMutablePointer<Float>, total: Int, at start: Int,
                              accent: Bool) {
         let rise = max(1, Int(sampleRate * 0.002))
@@ -523,10 +525,7 @@ final class Metronome {
             if n > frames - taper {
                 env *= 0.5 + 0.5 * cos(.pi * Double(n - (frames - taper)) / Double(taper))
             }
-            // Negative wraps to the end of the measure, where the downbeat's
-            // run-up belongs.
-            let index = (((start - rise + n) % total) + total) % total
-            out[index] += Float(sin(2 * .pi * freq * t) * env) * amp
+            out[(start + n) % total] += Float(sin(2 * .pi * freq * t) * env) * amp
         }
     }
 

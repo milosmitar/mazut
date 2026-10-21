@@ -99,3 +99,25 @@ struct TimingTapeChart: View {
         return value > 0 ? "+\(Int(value)) late" : "−\(Int(abs(value))) early"
     }
 }
+
+// MARK: - Previews
+
+// The chart takes plain values and touches no audio, so unlike `ContentView` it
+// previews in the canvas. A take that starts ragged, drifts late, then settles.
+#Preview("Tape — a whole take") {
+    TimingTapeChart(hits: [-48, 12, -31, 5, 18, -9, 22, 41, 35, 52, 44, 28, 16, 31, 9, -14, 20, 33]
+        .enumerated()
+        .map { TimingCoach.Hit(index: $0.offset, deviationMs: $0.element) })
+        .frame(height: 150)
+        .padding()
+}
+
+#Preview("Tape — first few notes") {
+    // Fewer notes than the window: the x domain still has to hold its width, or
+    // the first points sit on the plot edge.
+    TimingTapeChart(hits: [8, -14, 3, 21]
+        .enumerated()
+        .map { TimingCoach.Hit(index: $0.offset, deviationMs: $0.element) })
+        .frame(height: 150)
+        .padding()
+}

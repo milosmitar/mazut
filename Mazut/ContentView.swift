@@ -185,9 +185,8 @@ struct ContentView: View {
     }
 
     private var libraryView: some View {
-        VStack(spacing: 0) {
-            let songs = sortedLibrary
-            List {
+        let songs = sortedLibrary
+        return List {
                 Section {
                     ForEach(songs) { song in
                         Button {
@@ -232,15 +231,34 @@ struct ContentView: View {
                     let total = library.reduce(Int64(0)) { $0 + $1.size }
                     Text("\(library.count) \(songPlural(library.count)) · total \(total.formatted(.byteCount(style: .file)))")
                 }
+                // `scrollContentBackground(.hidden)` only clears the scroll view's
+                // own backdrop; each row still paints the grouped-background grey
+                // on top of it. This is what lets the wallpaper through.
+                .listRowBackground(Color.clear)
+                // Row content inset. On its own this measures from the inset-group
+                // card's edge, not the screen's — the `contentMargins` below is
+                // what removes that outer margin so 10 really is 10.
+                .listRowInsets(EdgeInsets(top: 8, leading: Self.listSideInset,
+                                          bottom: 8, trailing: Self.listSideInset))
             }
-            .listStyle(.insetGrouped)
-            .scrollContentBackground(.hidden)
-
+        .listStyle(.insetGrouped)
+        .scrollContentBackground(.hidden)
+        // Drops the inset-grouped section's own side margin, which would otherwise
+        // stack on top of the row insets and land the content near 30 pt.
+        .contentMargins(.horizontal, 0, for: .scrollContent)
+        .scrollIndicators(.hidden)
+        // Not stacked below the list any more. `safeAreaInset` does both halves of
+        // what a floating button needs: it draws the button over the scroll view,
+        // so rows pass behind it and the blur has something to blur, *and* it
+        // insets the scroll content by the button's height, so the last song can
+        // still be scrolled clear instead of sitting under it forever.
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             addNewMenu
         }
     }
 
-    /// "Add new" menu (separate / download).
+    /// "Add new" menu (separate / download). Floats over the library — the
+    /// `safeAreaInset` in `libraryView` is what places it.
     private var addNewMenu: some View {
         Menu {
             Button {
@@ -256,12 +274,40 @@ struct ContentView: View {
         } label: {
             Label("Add new", systemImage: "plus")
                 .font(.headline)
+                .foregroundStyle(.white)
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 6)
+                .padding(.vertical, 14)
+                .background {
+                    // Material underneath, colour over it at partial opacity. The
+                    // order matters: a solid fill would have nothing to see
+                    // through, and the blur would be invisible. The hairline keeps
+                    // the edge legible where a pale row passes behind it.
+                    RoundedRectangle(cornerRadius: 30, style: .continuous)
+                        .fill(.ultraThinMaterial)
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 30, style: .continuous)
+                                .fill(Color("mazut_red"))
+                        }
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 30, style: .continuous)
+                                .strokeBorder(Color.white.opacity(0.18), lineWidth: 0.5)
+                        }
+                        .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
+                }
         }
-        .buttonStyle(.borderedProminent)
-        .padding()
+        .buttonStyle(.plain)
+        // Lines the button up with the floating tab bar below it. Measured rather
+        // than guessed — the system gives no constant for it — off a screenshot:
+        // the bar's capsule runs 339 pt wide on a 375 pt screen.
+        .padding(.horizontal, Self.floatingBarInset)
+        .padding(.bottom, 8)
     }
+
+    /// Side inset the system's floating tab bar uses. The one number to nudge if
+    /// the button and the bar ever drift apart.
+    private static let floatingBarInset: CGFloat = 18
+    /// Side inset for the library rows.
+    private static let listSideInset: CGFloat = 18
 
     // MARK: - Tab: Playlists
 
@@ -1269,18 +1315,15 @@ struct SongRow: View {
     var body: some View {
         HStack(spacing: 12) {
             artwork
-            VStack(alignment: .leading, spacing: 2) {
-                Text(song.title)
-                    .font(.body)
-                    .foregroundStyle(.primary)
-                Text(Self.subtitle(for: song))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            Text(Self.label(for: song))
+                .font(.system(size: 16, weight: .bold))
+                
+                .foregroundStyle(.white)
+                .lineLimit(2)
             Spacer()
             Image(systemName: "chevron.right")
                 .font(.caption)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(Color("mazut_red"))
         }
     }
 
@@ -1300,24 +1343,19 @@ struct SongRow: View {
                 .frame(width: side, height: side)
                 .overlay {
                     Image(systemName: "music.note")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Color("mazut_red"))
                 }
         }
     }
 
-    /// Subtitle: artist · duration · date (omits empty parts).
-    static func subtitle(for song: CachedSong) -> String {
-        var parts: [String] = []
-        if !song.artist.isEmpty { parts.append(song.artist) }
-        if song.duration > 0 { parts.append(timeString(song.duration)) }
-        parts.append(song.date.formatted(date: .abbreviated, time: .omitted))
-        return parts.joined(separator: " · ")
-    }
-
-    static func timeString(_ t: TimeInterval) -> String {
-        guard t.isFinite else { return "0:00" }
-        let total = Int(t)
-        return String(format: "%d:%02d", total / 60, total % 60)
+    /// "ARTIST - Title", or just the title when there's no artist.
+    ///
+    /// Uppercased on the string rather than with `.textCase(.uppercase)`, which
+    /// applies to the whole `Text` and would take the song title with it. The
+    /// lock screen keeps the artist as written — `setNowPlaying` passes
+    /// `song.artist` straight through — since that is system UI, not ours.
+    static func label(for song: CachedSong) -> String {
+        song.artist.isEmpty ? song.title : "\(song.artist.uppercased()) - \(song.title)"
     }
 }
 

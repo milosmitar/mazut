@@ -88,9 +88,10 @@ final class TimingCoach {
     /// verdict; everything else is an interruption.
     enum StopReason { case user, interrupted }
 
-    /// What the microphone is doing. Over the speaker a take opens with
-    /// `soundCheck`, where onsets are counted but nothing is graded; over
-    /// headphones it goes straight to `grading`.
+    /// What the microphone is doing. Every take opens with `soundCheck`, where
+    /// onsets are counted but nothing is graded — every take, on every route, for
+    /// the reason the file header gives: a port type cannot say whether the thing
+    /// on the other end is in someone's ears or across the room.
     enum Phase { case idle, soundCheck, grading }
 
     /// A note inside this window counts as on the beat.
@@ -115,6 +116,14 @@ final class TimingCoach {
     /// How far above chance the busiest bin has to stand. With `n` onsets scattered
     /// at random each bin holds about n/bins, give or take its own square root, so
     /// this many deviations clear of the mean is not scatter.
+    ///
+    /// Nominal, not exact: the bar is the tail of a single histogram, while
+    /// `peakPhaseCount` takes the larger of two offset binnings and so gets about
+    /// twice the chances — the effective significance is nearer 3 than 3.5. Left
+    /// as it is on purpose. Widening it to restore the nominal figure would cost
+    /// leak detection, and the number that matters was measured end to end rather
+    /// than derived: refusals run at 0% for up to four onsets in a quiet room,
+    /// 2.5-3% at eight, while a leak is caught 100% of the time at every tempo.
     private static let soundCheckPeakSigma = 3.5
     /// …and never fewer than this many in the bin, so a handful of onsets cannot
     /// clear the bar just by landing together.
@@ -122,6 +131,12 @@ final class TimingCoach {
     /// Onsets per second of listening above which the room is refused outright
     /// rather than warned about.
     private static let soundCheckNoiseCeiling = 2.0
+    /// …and above which it is worth warning about. Both are rates, so the verdict
+    /// does not depend on how long the window happened to be.
+    private static let soundCheckQuietRate = 0.5
+    /// How far the output volume may rise above what the check passed at before
+    /// the take is stopped. One hardware step is 1/16, so this is a nudge.
+    private static let volumeTolerance: Float = 0.05
     /// Below this a take is too short to say anything about.
     private static let minimumNotesForSummary = 4
     /// How many notes the chart keeps.
@@ -214,18 +229,28 @@ final class TimingCoach {
     /// The output ports the sound check passed for. Notes are graded only while
     /// the route still matches — the check says nothing about any other one.
     @ObservationIgnored private var checkedOutputs: Set<String> = []
-    /// Kept by the route observer instead of re-read per note: `currentRoute` is a
-    /// cross-process property and both this and the observer run on the main
-    /// actor, so the flag gives the same ordering guarantee for nothing.
-    @ObservationIgnored private var routeMatchesCheck = true
     /// Until when a route change counts as the session still settling.
     @ObservationIgnored private var routeSettlesAt = Date.distantPast
-    /// How many times the level meter was published during the check. The tap
-    /// publishes on a timer whenever buffers arrive, so a non-zero count means the
-    /// microphone is delivering — which is the thing worth testing. A check that
-    /// heard nothing from a dead microphone would otherwise pass vacuously and
-    /// then grade an empty take forever.
-    @ObservationIgnored private var soundCheckLevelUpdates = 0
+    /// Output volume the check was passed at, and the watch that enforces it.
+    ///
+    /// The route was pinned from the start, but volume is the variable that
+    /// actually governs leakage — the refusal message says "turn the volume down"
+    /// in as many words. Nothing posts a route change when the volume keys are
+    /// pressed, so without this a take that passed quietly could be turned up
+    /// afterwards and go straight back to grading the metronome's own click as a
+    /// flawless performance.
+    @ObservationIgnored private var checkedVolume: Float = 0
+    @ObservationIgnored private var volumeObserver: NSKeyValueObservation?
+    /// Whether any non-zero audio reached the detector during the check.
+    ///
+    /// Not a count of level publishes: those run off a 50 ms timer that fires
+    /// whenever a buffer arrives, regardless of what is in it, so an input the
+    /// system has muted or a microphone under a case delivers zeros at the normal
+    /// rate and satisfies a counter. Not a loudness threshold either — that
+    /// refuses the best setup there is, a working microphone in a quiet room. Any
+    /// real microphone has a noise floor orders above this; only a dead one is
+    /// bit-exact silent.
+    @ObservationIgnored private var soundCheckSawSignal = false
     /// Whether the click track could be read at all, probed once after the warm-up.
     @ObservationIgnored private var soundCheckGridReadable = true
     /// Length of the counting part of the check, for the onset rate.
@@ -287,6 +312,7 @@ final class TimingCoach {
         phase = .idle   // stops grading notes still in flight on the analysis queue
         inputLevel = 0
         inputSampleRate = 0
+        stopObservingVolume()
         metronome?.onInputTapLost = nil
         metronome?.onGridChanged = nil
         metronome?.detachInputTap()
@@ -350,7 +376,11 @@ final class TimingCoach {
 
         // An engine rebuild would silently throw the tap away — stop instead of
         // staying green with no buffers arriving.
-        metronome.onInputTapLost = { [weak self] in self?.stop() }
+        metronome.onInputTapLost = { [weak self] in
+            guard let self, self.isListening else { return }
+            self.stop()
+            self.failure = "Lost the microphone — start the check again."
+        }
 
         // One engine for click + microphone; two of them fight over the route.
         guard let rate = metronome.attachInputTap(bufferSize: 1024, block: tap) else {
@@ -375,7 +405,9 @@ final class TimingCoach {
             self.stop()
             // The route-change path says why; this one used to end the take with
             // the readout simply vanishing and no sheet, which reads as a bug.
-            self.failure = "The tempo or time signature changed, so the take stopped. Start the check again."
+            // Tempo, time signature, sound and groove all rebuild the loop, and
+            // all four are reachable mid-take, so the message names none of them.
+            self.failure = "The click changed, so the grid did too and the take stopped. Start the check again."
         }
         // Read the route only now. Engaging the input is itself a route-changing
         // event — an A2DP route has no input side, so iOS renegotiates when the
@@ -383,14 +415,10 @@ final class TimingCoach {
         // observer kill the take the moment the new route settled.
         refreshRoute()
         checkedOutputs = Self.outputPorts()
-        routeMatchesCheck = true
-        // Activating the session and engaging the input both post route changes
-        // asynchronously, and on an A2DP route the input side really does
-        // renegotiate. Those land after this returns, so for a moment a changed
-        // route means "still settling", not "the user switched outputs" — without
-        // this the take dies on the frame it starts, every time, on exactly the
-        // route that needs the most care.
-        routeSettlesAt = Date().addingTimeInterval(1.5)
+        observeVolume()
+        // No separate "route still valid" flag guards `register`: the observer
+        // stops the take, `stop()` sets `phase = .idle`, and `register` already
+        // returns on that. A second guard there was unreachable.
         phase = .soundCheck
         startSoundCheck(metronome)
     }
@@ -414,6 +442,9 @@ final class TimingCoach {
         // stricter standard than the grading it is supposed to gate, and refuse
         // setups that work.
         let warmUp = 1
+        // The route may still be settling from activating the session and engaging
+        // the input; let it, right up to the moment the tally starts.
+        routeSettlesAt = Date().addingTimeInterval(Double(warmUp))
         // Twice `soundCheckMinimumOnsets` beats, not exactly that many. Sized to
         // the minimum, the window holds precisely as many leaked clicks as the bar
         // demands, so any room noise at all raises the bar past what the window can
@@ -485,30 +516,37 @@ final class TimingCoach {
         // Liveness is "did buffers arrive", not "was it loud enough". A level
         // threshold refuses the best setup there is — a quiet room over
         // headphones, where the microphone is working and has nothing to report.
-        guard soundCheckLevelUpdates > 0 else {
+        guard soundCheckSawSignal else {
             return .refuse("The microphone isn't picking anything up. Check that nothing is covering it and that no other app is using it.")
         }
         guard soundCheckGridReadable, soundCheckUnreadableRatio < 0.5 else {
             return .refuse("Lost track of the click while checking. Start the metronome again.")
         }
         let heard = soundCheckPhases.count
-        guard heard >= Self.soundCheckMinimumOnsets else { return .pass(noisy: false) }
+        let rate = Double(heard) / max(1, soundCheckListenSeconds)
+        guard heard >= Self.soundCheckMinimumOnsets else {
+            return .pass(noisy: rate > Self.soundCheckQuietRate)
+        }
 
         let expected = Double(heard) / Double(Self.soundCheckBins)
         let bar = max(Double(Self.soundCheckMinimumOnsets),
                       expected + Self.soundCheckPeakSigma * expected.squareRoot())
         let peak = Self.peakPhaseCount(soundCheckPhases)
         if Double(peak) >= bar {
-            return .refuse("The microphone can hear the click — \(peak) of them in step with the beat. Turn the volume down, move the phone away from the guitar, or use headphones.")
+            // Phase alone cannot separate a leaked click from the player keeping
+            // time — a tapped foot is on the beat by definition, and it is close
+            // to a reflex while a metronome is running. So the message names both
+            // and offers a remedy for each, rather than sending someone to turn
+            // down a volume that was never the problem.
+            return .refuse("Something is landing right on the beat — \(peak) times. That is either the click coming back through the speaker or you keeping time. Stay completely still, turn the volume down, or use headphones.")
         }
         // Above this rate the bar itself outgrows the number of clicks the window
         // can hold, so leakage could hide behind the noise. Refusing closes that,
         // and a room this busy was not going to give a usable take anyway.
-        let rate = Double(heard) / max(1, soundCheckListenSeconds)
         if rate > Self.soundCheckNoiseCeiling {
             return .refuse("Too much going on in the room to tell your playing from the click. Somewhere quieter, or headphones.")
         }
-        return .pass(noisy: true)
+        return .pass(noisy: rate > Self.soundCheckQuietRate)
     }
 
     /// The most onsets sharing a point in the beat. Counted over two binnings a
@@ -531,7 +569,7 @@ final class TimingCoach {
     private func resetSoundCheck() {
         soundCheckPhases.removeAll()
         soundCheckUnreadable = 0
-        soundCheckLevelUpdates = 0
+        soundCheckSawSignal = false
     }
 
     /// Share of onsets whose grid position could not be read. A ratio and not a
@@ -566,18 +604,55 @@ final class TimingCoach {
             // which cannot tell a Bluetooth headset from a Bluetooth speaker.
             let ports = Self.outputPorts()
             guard deviceGone || ports != self.checkedOutputs else { return }
-            if !deviceGone, Date() < self.routeSettlesAt {
-                self.checkedOutputs = ports   // still settling, not a switch
+            // Settling, not a switch. `deviceGone` is deliberately not excluded:
+            // the A2DP renegotiation this window exists for drops the old output
+            // port, so iOS reports it as exactly that, and excluding it skipped
+            // the grace in the one case it was added for. Nothing has been
+            // counted yet — the window closes when the tally starts — so re-pinning
+            // is sound and the verdict is reached entirely on the settled route.
+            if Date() < self.routeSettlesAt {
+                self.checkedOutputs = ports
+                self.checkedVolume = Self.currentVolume()
                 return
             }
-            self.routeMatchesCheck = false
             self.stop()
             self.failure = "The audio output changed — start the check again."
         }
         #endif
     }
 
+    /// Watch the output volume for the life of the take. Only a rise matters:
+    /// turning it down can only reduce what the microphone hears.
+    private func observeVolume() {
+        #if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+        checkedVolume = session.outputVolume
+        volumeObserver = session.observe(\.outputVolume, options: [.new]) { [weak self] _, change in
+            guard let volume = change.newValue else { return }
+            Task { @MainActor [weak self] in
+                guard let self, self.isListening,
+                      volume > self.checkedVolume + Self.volumeTolerance else { return }
+                self.stop()
+                self.failure = "The volume went up, so the check no longer holds. Start it again."
+            }
+        }
+        #endif
+    }
+
+    private func stopObservingVolume() {
+        volumeObserver?.invalidate()
+        volumeObserver = nil
+    }
+
     /// The current output ports, by type. The sound check is pinned to this set.
+    private static func currentVolume() -> Float {
+        #if os(iOS)
+        AVAudioSession.sharedInstance().outputVolume
+        #else
+        0
+        #endif
+    }
+
     private static func outputPorts() -> Set<String> {
         #if os(iOS)
         Set(AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portType.rawValue))
@@ -591,9 +666,6 @@ final class TimingCoach {
     func refreshRoute() {
         #if os(iOS)
         let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
-        // An unknown route counts as a speaker: refusing to measure is the safe
-        // side of that guess, since measuring the metronome's own click reports
-        // a flawless take to someone who played nothing.
         // Unknown counts as a speaker: it only drives advice now, and advising
         // headphones is the harmless side of that guess.
         hearsMetronomeOverSpeaker = outputs.isEmpty || outputs.contains { $0.portType == .builtInSpeaker }
@@ -610,7 +682,7 @@ final class TimingCoach {
     /// Peak level with a slow fall, so the meter doesn't flicker between buffers.
     private func updateLevel(_ peak: Float) {
         inputLevel = peak > inputLevel ? peak : inputLevel * 0.8 + peak * 0.2
-        if phase == .soundCheck { soundCheckLevelUpdates += 1 }
+        if phase == .soundCheck, peak > 1e-6 { soundCheckSawSignal = true }
     }
 
     /// Grade one detected note against the metronome grid.
@@ -624,17 +696,16 @@ final class TimingCoach {
             // Heard while the player was asked to stay quiet. Only the phase is
             // recorded; what it means is decided once, over all of them, in
             // `soundCheckVerdict()`.
-            if let phase = metronome?.beatPhase(atHostTime: hostTime) {
-                soundCheckPhases.append(phase)
+            // `beat`, not `phase`: the branch is selected by the `phase` property
+            // two lines up, and a Double shadowing that enum is the same hazard the
+            // notch loop carries a warning about.
+            if let beat = metronome?.beatPhase(atHostTime: hostTime) {
+                soundCheckPhases.append(beat)
             } else {
                 soundCheckUnreadable += 1
             }
             return
         }
-        // Grade only on the route the sound check passed for. The route observer
-        // stops the take when it changes, but it runs on the same queue as this
-        // hop and may arrive second.
-        guard routeMatchesCheck else { return }
         guard let deviation = metronome?.deviation(atHostTime: hostTime) else { return }
         let hit = Hit(index: gradedNotes, deviationMs: deviation * 1000)
         hits.append(hit)
@@ -766,17 +837,18 @@ struct OnsetDetector {
     /// products start far weaker than the fundamental they come from.
     private static var notchPlan: [(frequency: Double, sections: Int)] {
         let tones = Metronome.clickTones
-        // Written out rather than dedued through a Set of products: with the
-        // current tones 3x the beat and 2x the accent are both exactly 3 kHz, but
-        // that is bit-equality between two independently computed Doubles, and
-        // retuning the tones could leave two overlapping notches at one harmonic
-        // — double the depth, in the band this Q is chosen to protect.
-        return
-        [(tones.beat, 3),         // 1000
-         (tones.accent, 3),       // 1500
-         (tones.beat * 2, 2),     // 2000 — the beat's 2nd
-         (tones.beat * 3, 2),     // 3000 — the beat's 3rd and the accent's 2nd
-         (tones.accent * 3, 2)]   // 4500 — the accent's 3rd
+        // Every 2nd and 3rd harmonic of both tones, merged by nearness rather
+        // than by equality. With the current tones the beat's 3rd and the accent's
+        // 2nd are both 3 kHz and collapse to one entry — but that is bit-equality
+        // between two independently computed Doubles, so listing only one of them
+        // would leave the other uncovered the moment the tones are retuned, and an
+        // uncovered harmonic is what lets a distorting speaker through.
+        var plan: [(frequency: Double, sections: Int)] = [(tones.beat, 3), (tones.accent, 3)]
+        for harmonic in [tones.beat * 2, tones.beat * 3, tones.accent * 2, tones.accent * 3] {
+            guard !plan.contains(where: { abs($0.frequency - harmonic) < 1 }) else { continue }
+            plan.append((harmonic, 2))
+        }
+        return plan
     }
 
     /// One RBJ notch section, direct form I.
