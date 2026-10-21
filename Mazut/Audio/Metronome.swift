@@ -129,11 +129,21 @@ final class Metronome {
         didSet { if isRunning, sound == .drums, groove != oldValue { reschedule() } }
     }
 
+    /// The click's two tones. `OnsetDetector` notches exactly these out of the
+    /// microphone signal, so the two declarations have to stay in step — hence one
+    /// of them, here, where the sound is made.
+    static let clickTones = (beat: 1_000.0, accent: 1_500.0)
+
     /// Beats per measure actually being played: a fixed groove overrides the setting.
     var activeBeatsPerMeasure: Int {
         if sound == .drums, let beats = groove.beats { return beats }
         return beatsPerMeasure
     }
+
+    /// One beat in seconds at the current tempo.
+    var beatSeconds: Double { 60.0 / Double(bpm) }
+    /// One measure in seconds at the current tempo.
+    var measureSeconds: Double { Double(activeBeatsPerMeasure) * beatSeconds }
 
     /// Set by `TimingCoach` while it owns the audio session (`.playAndRecord`) —
     /// the metronome must not switch the category back to `.playback` under it.
@@ -142,6 +152,12 @@ final class Metronome {
     /// Called when an engine rebuild dropped the microphone tap, so the coach can
     /// stop instead of sitting green with no buffers arriving.
     var onInputTapLost: (() -> Void)?
+    /// Called when the loop was rebuilt under a running take, which resets the
+    /// player's sample time and can change the grid step itself. Tempo, time
+    /// signature, sound and groove all do it, so the notification lives in
+    /// `reschedule()` rather than being re-derived per property at the call site:
+    /// a take graded across two different grids reports one figure over both.
+    var onGridChanged: (() -> Void)?
     /// Kept so a rebuild can re-install the same tap instead of losing it.
     private var currentTap: (size: AVAudioFrameCount, block: AVAudioNodeTapBlock)?
     private var hasInputTap = false
@@ -249,10 +265,22 @@ final class Metronome {
     }
 
     /// Tempo/time signature changed while playing — reschedule the loop.
+    ///
+    /// The engine check is load-bearing. `isRunning` means "the metronome is
+    /// playing as far as the UI is concerned", which stays true across the timing
+    /// coach's teardown, where `detachInputTap()` has already stopped the engine.
+    /// Starting a player node on a stopped engine — or one whose node was never
+    /// attached, as on the microphone-failure path — raises an uncatchable
+    /// AVAudioEngine exception. The caller that stopped the engine restores the
+    /// loop itself via `restartIfRunning()`.
     private func reschedule() {
+        guard engine.isRunning else { return }
         player.stop()
         scheduleLoop()
         player.play()
+        // Async: the handler tears the coach down, which calls back into here.
+        let notify = onGridChanged
+        DispatchQueue.main.async { notify?() }
     }
 
     /// Re-establish the graph after someone else changed the session category or
@@ -335,19 +363,48 @@ final class Metronome {
     /// output latency is taken out; the caller is expected to have already taken
     /// out the microphone's input latency.
     func deviation(atHostTime hostTime: UInt64) -> Double? {
-        // No host time on the render clock means there is nothing to measure
-        // against: "now" is not the render time — it is however long the onset
-        // spent hopping between queues — and would produce an invented number.
+        guard let position = playbackPosition(atHostTime: hostTime) else { return nil }
+        let step = Double(measureFrames) / sampleRate / Double(gridStepsPerMeasure)
+        guard step > 0 else { return nil }
+        // Distance to the nearest step, so the result lands in ±step/2.
+        return position - (position / step).rounded() * step
+    }
+
+    /// Where the loop had reached at `hostTime`, in seconds since the player
+    /// started, with the click's output latency taken out.
+    ///
+    /// The one place that conversion lives. It is the most load-bearing
+    /// expression in the timing feature — both what a note is graded against and
+    /// what the sound check looks for leakage in — and a second copy would drift.
+    ///
+    /// No host time on the render clock means there is nothing to measure
+    /// against: "now" is not the render time, it is however long the onset spent
+    /// hopping between queues, and would produce an invented number.
+    private func playbackPosition(atHostTime hostTime: UInt64) -> Double? {
         guard isRunning, measureFrames > 0,
               let nodeTime = player.lastRenderTime, nodeTime.isHostTimeValid,
               let playerTime = player.playerTime(forNodeTime: nodeTime) else { return nil }
         let elapsed = AVAudioTime.seconds(forHostTime: hostTime)
             - AVAudioTime.seconds(forHostTime: nodeTime.hostTime)
-        let position = Double(playerTime.sampleTime) / sampleRate + elapsed - outputLatency
-        let step = Double(measureFrames) / sampleRate / Double(gridStepsPerMeasure)
-        guard step > 0 else { return nil }
-        // Distance to the nearest step, so the result lands in ±step/2.
-        return position - (position / step).rounded() * step
+        return Double(playerTime.sampleTime) / sampleRate + elapsed - outputLatency
+    }
+
+    /// Where `hostTime` falls inside the current beat, as a fraction in 0..<1.
+    /// `nil` while the metronome is stopped.
+    ///
+    /// Unlike `deviation(atHostTime:)` this is not a distance from the grid, and
+    /// that is the point: it is used to ask whether a sound is *locked* to the
+    /// beat, not whether it is on it. A constant error in the latency
+    /// compensation — and the acoustic path over a speaker has one that
+    /// `outputLatency` plus `inputLatency` do not describe — rotates every phase
+    /// by the same amount and leaves that answer untouched.
+    func beatPhase(atHostTime hostTime: UInt64) -> Double? {
+        guard activeBeatsPerMeasure > 0,
+              let position = playbackPosition(atHostTime: hostTime) else { return nil }
+        let beat = Double(measureFrames) / sampleRate / Double(activeBeatsPerMeasure)
+        guard beat > 0 else { return nil }
+        let phase = position.truncatingRemainder(dividingBy: beat) / beat
+        return phase < 0 ? phase + 1 : phase
     }
 
     private var outputLatency: Double {
@@ -426,16 +483,50 @@ final class Metronome {
 
     // MARK: - Voices
 
+    /// The click: a decaying sine at `clickTones`, accented on the first beat.
+    ///
+    /// The envelope is ramped at both ends, and that is what lets the timing coach
+    /// measure over a speaker while this stays the only click the app has.
+    ///
+    /// An instant attack is a step discontinuity, and a step has energy at *every*
+    /// frequency — so no filter can take the click out of the microphone signal,
+    /// however narrow. Measured: with the attack instant, notches on the click's
+    /// own two tones still leave it 7-18x above the detector's threshold and it
+    /// fires. A 2 ms raised-cosine rise drops it to a sixth of that threshold,
+    /// because then essentially all of the click's energy really is at the
+    /// frequencies the detector is deaf to. The 5 ms taper at the end is the same
+    /// argument applied to the cut-off.
+    ///
+    /// Everything audible is unchanged — pitch, level and the 8 ms decay — so the
+    /// click sounds the same whether or not anything is listening.
+    ///
+    /// The rise sits *before* the beat so the envelope peaks on it. A click peaking
+    /// 2 ms after its grid position would have the player locking on to what they
+    /// hear while being graded against the grid, and the whole take would read as
+    /// 2 ms early.
     private func renderClick(_ out: UnsafeMutablePointer<Float>, total: Int, at start: Int,
                              accent: Bool) {
-        let frames = min(total, Int(sampleRate * 0.03))
+        let rise = max(1, Int(sampleRate * 0.002))
+        let taper = max(1, Int(sampleRate * 0.005))
+        let frames = min(total, Int(sampleRate * 0.035))
         let decay = sampleRate * 0.008
-        let freq = accent ? 1_500.0 : 1_000.0
+        let freq = accent ? Self.clickTones.accent : Self.clickTones.beat
         let amp: Float = accent ? 0.9 : 0.55
         for n in 0..<frames {
             let t = Double(n) / sampleRate
-            let env = Float(exp(-Double(n) / decay))
-            out[(start + n) % total] += Float(sin(2 * .pi * freq * t)) * env * amp
+            // The decay starts at the beat, not at the start of the rise, so the
+            // envelope reaches 1 exactly on the beat and the tail is the same
+            // curve as before this ramp existed. Letting it decay through the
+            // rise instead costs 2.2 dB of peak — an audibly quieter click.
+            var env = exp(-Double(max(0, n - rise)) / decay)
+            if n < rise { env *= 0.5 - 0.5 * cos(.pi * Double(n) / Double(rise)) }
+            if n > frames - taper {
+                env *= 0.5 + 0.5 * cos(.pi * Double(n - (frames - taper)) / Double(taper))
+            }
+            // Negative wraps to the end of the measure, where the downbeat's
+            // run-up belongs.
+            let index = (((start - rise + n) % total) + total) % total
+            out[index] += Float(sin(2 * .pi * freq * t) * env) * amp
         }
     }
 

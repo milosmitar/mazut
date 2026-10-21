@@ -478,8 +478,10 @@ struct ContentView: View {
 
     // MARK: - Timing check (microphone)
 
-    /// Grades what you play against the click grid. Headphones only — over the
-    /// speaker the microphone hears the metronome and would grade its own click.
+    /// Grades what you play against the click grid, on any route. The click moves
+    /// to a tone the detector is notched deaf to, and every take opens with a
+    /// sound check that proves the microphone can't make it out — so there is
+    /// nothing for the UI to gate on beyond the metronome actually running.
     private var timingSection: some View {
         VStack(spacing: 10) {
             Button {
@@ -497,10 +499,7 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
             .tint(timingCoach.isListening ? .green : .accentColor)
-            // Measuring over the speaker is impossible, not merely inaccurate:
-            // the microphone hears the clicks. Say so on the button rather than
-            // letting it run and quietly grading nothing.
-            .disabled(!metronome.isRunning || timingCoach.hearsMetronomeOverSpeaker)
+            .disabled(!metronome.isRunning)
 
             if timingCoach.permissionDenied {
                 Text("Microphone access is off — turn it on in Settings › Mazut.")
@@ -512,31 +511,71 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
                     .multilineTextAlignment(.center)
-            } else if timingCoach.hearsMetronomeOverSpeaker {
-                Label("Plug in headphones — over the speaker the microphone hears the metronome, not just you.",
-                      systemImage: "headphones")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .multilineTextAlignment(.center)
+            } else if timingCoach.phase == .soundCheck {
+                soundCheckNotice
             } else if timingCoach.isListening {
                 timingReadout
             } else {
-                Text("Play along with the click and each note gets measured against it.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
+                VStack(spacing: 4) {
+                    Text("Play along with the click and each note gets measured against it. It listens for a few seconds first, to check it can't hear the click itself.")
+                    // Advice, not a gate: drums have no tone to notch out, so
+                    // over a speaker the sound check will refuse them. Saying so
+                    // up front beats letting the check explain it afterwards.
+                    if metronome.sound == .drums, timingCoach.hearsMetronomeOverSpeaker {
+                        Label("With Drums that needs headphones.", systemImage: "headphones")
+                            .foregroundStyle(.orange)
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
             }
         }
     }
 
+    /// The sound check only means anything if the player really does stay quiet,
+    /// so the countdown is the instruction rather than decoration — and the input
+    /// meter stays visible, since a microphone reading zero is the other reason
+    /// a check could pass.
+    private var soundCheckNotice: some View {
+        VStack(spacing: 6) {
+            Label("Stay quiet — checking whether the microphone can hear the click.",
+                  systemImage: "ear")
+                .font(.caption)
+                .multilineTextAlignment(.center)
+            Text("\(timingCoach.soundCheckSecondsLeft)")
+                .font(.largeTitle.bold().monospacedDigit())
+                .contentTransition(.numericText(countsDown: true))
+                .animation(.easeOut(duration: 0.2), value: timingCoach.soundCheckSecondsLeft)
+            inputMeter
+        }
+    }
+
+    /// Shared by the sound check and the live readout: a microphone reading zero
+    /// is how a dead microphone shows itself in both, so the two must not drift.
+    private var inputMeter: some View {
+        ProgressView(value: Double(min(timingCoach.inputLevel * 3, 1)))
+            .progressViewStyle(.linear)
+            .tint(timingCoach.inputLevel > 0.01 ? .green : .gray)
+            .frame(maxWidth: 160)
+    }
+
     private var timingReadout: some View {
         VStack(spacing: 8) {
-            // Input meter — shows the microphone is actually hearing something,
-            // so "no readings" can be told apart from "no signal".
-            ProgressView(value: Double(min(timingCoach.inputLevel * 3, 1)))
-                .progressViewStyle(.linear)
-                .tint(timingCoach.inputLevel > 0.01 ? .green : .gray)
-                .frame(maxWidth: 160)
+            // Shows the microphone is actually hearing something, so "no
+            // readings" can be told apart from "no signal".
+            inputMeter
+
+            if timingCoach.roomIsNoisy {
+                // The check heard things, but scattered rather than in step with
+                // the beat — so not the click. Measuring works; it will just
+                // count some of the room as notes.
+                Label("The room isn't silent — some of what gets measured may not be you.",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
+            }
 
             if let hit = timingCoach.lastHit {
                 Text(deviationText(hit.deviationMs))

@@ -67,6 +67,14 @@ struct TimingSummarySheet: View {
             Divider()
             statRow("Range", "\(Self.signed(summary.earliestMs)) … \(Self.signed(summary.latestMs)) ms",
                     note: "Earliest and latest note of the take.")
+            if summary.overSpeaker {
+                Divider()
+                // The take passed a sound check, so the numbers are real — but
+                // headphones are the cleaner setup and the sheet shouldn't let
+                // the figure above stand as if the two were equivalent.
+                statRow("Measured over", "speaker",
+                        note: "Headphones give the detector a cleaner signal to work from.")
+            }
         }
         .padding(.vertical, 4)
         .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))

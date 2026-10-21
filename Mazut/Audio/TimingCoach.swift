@@ -6,15 +6,39 @@
 //  every note played, how far it landed from the nearest grid step — early
 //  (rushing) or late (dragging).
 //
-//  Headphones are assumed. There is no echo cancellation here: over the speaker
-//  the microphone would hear the metronome itself, exactly on the beat, and the
-//  coach would happily grade its own click as a perfect performance. The UI says
-//  so; `hearsMetronomeOverSpeaker` reports when the current route is a speaker so
-//  the warning can be made loud.
-//
 //  Onset detection is time-domain (see `OnsetDetector`): a played attack is a
 //  sharp rise above the recent level, which is enough for anything percussive or
 //  plucked and costs a fraction of a spectral-flux analysis.
+//
+//  There is no echo cancellation. The hazard it would guard against is not noise
+//  but flattery: the metronome's click arrives exactly on the beat, so a
+//  detector that can hear it reports a flawless performance to someone who
+//  played nothing at all. Two things stand in its place.
+//
+//  *Separation by frequency.* The detector notches out `Metronome.clickTones` —
+//  the click's own two frequencies — which leaves it at a twentieth of the
+//  detector's threshold. The guitar is untouched: measured across every pitch
+//  from the low E to a bend whose fundamental sits inside one of the notches,
+//  detection is unchanged and the delay stays under 0.04 ms, because an onset
+//  rides on the broadband attack rather than on the fundamental. The click is not
+//  altered or substituted while measuring; it only needed its attack ramped, for
+//  the reason given in `Metronome.renderClick`. Drums get no such treatment —
+//  their voices are filtered noise across the same range as a pick attack, and
+//  there is no tone to notch out.
+//
+//  *Proof, per room.* The filter handles the tone, but a phone speaker also
+//  radiates a broadband thump through the body of the device, and whether that
+//  clears the threshold depends on the volume, the surface the phone is lying on
+//  and how close it is to the guitar — none of which is knowable in advance. So
+//  every take opens with a sound check: the click runs with the microphone open
+//  while the player stays quiet, and the take begins only if nothing was heard.
+//  See `startSoundCheck`.
+//
+//  The check runs on *every* route, not only the built-in speaker. Route types do
+//  not divide into "can leak" and "cannot": `.bluetoothA2DP` and `.airPlay` are a
+//  Bluetooth speaker or a HomePod as readily as headphones, and guessing from the
+//  port type is exactly the reasoning this feature cannot afford. Measuring costs
+//  a few seconds and needs no guess.
 //
 
 import AVFoundation
@@ -51,6 +75,11 @@ final class TimingCoach {
         let latestMs: Double
         /// The tail of the take, for the chart.
         let tape: [Hit]
+        /// Measured with the click coming out of the speaker rather than
+        /// headphones. It passed a sound check, but it is the weaker of the two
+        /// setups and the sheet says so rather than letting the number stand
+        /// unqualified.
+        let overSpeaker: Bool
 
         var accuracy: Double { notes > 0 ? Double(onTime) / Double(notes) : 0 }
     }
@@ -59,8 +88,40 @@ final class TimingCoach {
     /// verdict; everything else is an interruption.
     enum StopReason { case user, interrupted }
 
+    /// What the microphone is doing. Over the speaker a take opens with
+    /// `soundCheck`, where onsets are counted but nothing is graded; over
+    /// headphones it goes straight to `grading`.
+    enum Phase { case idle, soundCheck, grading }
+
     /// A note inside this window counts as on the beat.
     static let toleranceMs = 25.0
+    /// The sound check sorts what it hears by *phase within the beat*, in this
+    /// many bins, and asks whether any one bin is busier than scatter explains.
+    ///
+    /// Phase, rather than a window around the grid, because a window assumes the
+    /// latency compensation is exact. Over a speaker it is not — the sound still
+    /// has to cross the room, and the tap's own buffer is 21 ms at 48 kHz — so
+    /// every leaked click fell outside a ±8 ms window, was filed as room noise,
+    /// and a silent room got reported as too noisy to measure in. A constant
+    /// offset, however large, only moves which bin the clicks share.
+    ///
+    /// A bin, rather than the overall phase lock (the Rayleigh resultant), because
+    /// lock is a property of the whole set and a few leaked clicks among scattered
+    /// noise do not raise it: measured, eight leaked clicks mixed with six room
+    /// onsets scored 0.67, well under any usable threshold, and would have been
+    /// waved through. A busy bin survives the mixture — the same case is caught
+    /// 100% of the time.
+    private static let soundCheckBins = 16
+    /// How far above chance the busiest bin has to stand. With `n` onsets scattered
+    /// at random each bin holds about n/bins, give or take its own square root, so
+    /// this many deviations clear of the mean is not scatter.
+    private static let soundCheckPeakSigma = 3.5
+    /// …and never fewer than this many in the bin, so a handful of onsets cannot
+    /// clear the bar just by landing together.
+    private static let soundCheckMinimumOnsets = 4
+    /// Onsets per second of listening above which the room is refused outright
+    /// rather than warned about.
+    private static let soundCheckNoiseCeiling = 2.0
     /// Below this a take is too short to say anything about.
     private static let minimumNotesForSummary = 4
     /// How many notes the chart keeps.
@@ -71,7 +132,14 @@ final class TimingCoach {
 
     // MARK: Public state (observed by the UI)
 
-    private(set) var isListening = false
+    private(set) var phase: Phase = .idle
+    /// The microphone is open — in either phase.
+    var isListening: Bool { phase != .idle }
+    /// Seconds left of the sound check, for the "stay quiet" countdown.
+    private(set) var soundCheckSecondsLeft = 0
+    /// Set when the check passed but the room was not quiet: measuring still
+    /// works, it just picks up more than the player.
+    private(set) var roomIsNoisy = false
     /// Microphone permission denied → the UI shows instructions.
     private(set) var permissionDenied = false
     /// Why the last start attempt didn't take, for the UI to show.
@@ -99,11 +167,11 @@ final class TimingCoach {
         return recent.map(\.deviationMs).reduce(0, +) / Double(recent.count)
     }
 
-    /// True when the output route is a built-in speaker, i.e. the microphone
-    /// would hear the metronome as well as the player. Stored rather than
-    /// computed: the UI has to re-render when the route changes, and a computed
-    /// property reading `AVAudioSession` is outside the observation graph.
-    /// Any other route — wired, Bluetooth, USB, AirPlay — counts as headphones.
+    /// True when the output route is a built-in speaker. Advice for the UI only —
+    /// it no longer gates anything, because the sound check measures the thing
+    /// this used to be a proxy for, and measures it on every route. Stored rather
+    /// than computed: the UI has to re-render when the route changes, and a
+    /// computed property reading `AVAudioSession` is outside the observation graph.
     private(set) var hearsMetronomeOverSpeaker = true
 
     /// Smoothed input peak (0…1) — the UI shows it so a silent microphone is
@@ -143,6 +211,35 @@ final class TimingCoach {
     /// Set between the button tap and `beginCapture()`; cleared by `stop()` so a
     /// cancel during the permission prompt doesn't start capturing afterwards.
     @ObservationIgnored private var startRequested = false
+    /// The output ports the sound check passed for. Notes are graded only while
+    /// the route still matches — the check says nothing about any other one.
+    @ObservationIgnored private var checkedOutputs: Set<String> = []
+    /// Kept by the route observer instead of re-read per note: `currentRoute` is a
+    /// cross-process property and both this and the observer run on the main
+    /// actor, so the flag gives the same ordering guarantee for nothing.
+    @ObservationIgnored private var routeMatchesCheck = true
+    /// Until when a route change counts as the session still settling.
+    @ObservationIgnored private var routeSettlesAt = Date.distantPast
+    /// How many times the level meter was published during the check. The tap
+    /// publishes on a timer whenever buffers arrive, so a non-zero count means the
+    /// microphone is delivering — which is the thing worth testing. A check that
+    /// heard nothing from a dead microphone would otherwise pass vacuously and
+    /// then grade an empty take forever.
+    @ObservationIgnored private var soundCheckLevelUpdates = 0
+    /// Whether the click track could be read at all, probed once after the warm-up.
+    @ObservationIgnored private var soundCheckGridReadable = true
+    /// Length of the counting part of the check, for the onset rate.
+    @ObservationIgnored private var soundCheckListenSeconds: Double = 1
+    /// Phase within the beat of everything heard during the sound check. Leakage
+    /// from the speaker is locked to the beat by construction; a chair creak or a
+    /// breath is not, and telling them apart is what keeps a quiet room from being
+    /// reported as a speaker problem the player cannot fix by turning the volume
+    /// down.
+    @ObservationIgnored private var soundCheckPhases: [Double] = []
+    /// Onsets the click track could not be read for — an engine that has stopped
+    /// rendering. Nothing can be judged from those.
+    @ObservationIgnored private var soundCheckUnreadable = 0
+    @ObservationIgnored private var soundCheckTask: Task<Void, Never>?
     private weak var metronome: Metronome?
 
     init() {
@@ -180,12 +277,18 @@ final class TimingCoach {
     @discardableResult
     func stop(reason: StopReason = .interrupted) -> Summary? {
         startRequested = false   // cancels a start still waiting on the permission prompt
+        soundCheckTask?.cancel()
+        soundCheckTask = nil
+        soundCheckSecondsLeft = 0
+        roomIsNoisy = false
         guard isListening else { return nil }
-        let summary = reason == .user ? makeSummary() : nil
-        isListening = false   // stops grading notes still in flight on the analysis queue
+        // A take that never got past the sound check has nothing to report.
+        let summary = reason == .user && phase == .grading ? makeSummary() : nil
+        phase = .idle   // stops grading notes still in flight on the analysis queue
         inputLevel = 0
         inputSampleRate = 0
         metronome?.onInputTapLost = nil
+        metronome?.onGridChanged = nil
         metronome?.detachInputTap()
         // Hand the session back: the metronome sets its own category again.
         metronome?.sessionOwnedExternally = false
@@ -204,7 +307,15 @@ final class TimingCoach {
         startRequested = false
         configureSession()
 
-        analysisQueue.async { [weak self] in self?.detector = OnsetDetector() }
+        analysisQueue.async { [weak self] in
+            guard let self else { return }
+            self.detector = OnsetDetector()
+            // Carried over, these hand the new take the previous one's last
+            // 50 ms: the meter flashes at a level nothing is producing, and the
+            // sound check's liveness evidence starts out already satisfied.
+            self.pendingPeak = 0
+            self.lastLevelUpdate = 0
+        }
         let tap: AVAudioNodeTapBlock = { [weak self] buffer, time in
             guard let self, let samples = Tuner.monoSamples(buffer) else { return }
             let sampleRate = buffer.format.sampleRate
@@ -257,8 +368,178 @@ final class TimingCoach {
         hits.removeAll()
         detectedNotes = 0
         resetTake()
-        isListening = true
+        // A rebuilt loop resets the player's sample time and can change the grid
+        // step, so any take spanning one would be scored across two grids.
+        metronome.onGridChanged = { [weak self] in
+            guard let self, self.isListening else { return }
+            self.stop()
+            // The route-change path says why; this one used to end the take with
+            // the readout simply vanishing and no sheet, which reads as a bug.
+            self.failure = "The tempo or time signature changed, so the take stopped. Start the check again."
+        }
+        // Read the route only now. Engaging the input is itself a route-changing
+        // event — an A2DP route has no input side, so iOS renegotiates when the
+        // engine touches `inputNode` — and capturing it beforehand would have the
+        // observer kill the take the moment the new route settled.
         refreshRoute()
+        checkedOutputs = Self.outputPorts()
+        routeMatchesCheck = true
+        // Activating the session and engaging the input both post route changes
+        // asynchronously, and on an A2DP route the input side really does
+        // renegotiate. Those land after this returns, so for a moment a changed
+        // route means "still settling", not "the user switched outputs" — without
+        // this the take dies on the frame it starts, every time, on exactly the
+        // route that needs the most care.
+        routeSettlesAt = Date().addingTimeInterval(1.5)
+        phase = .soundCheck
+        startSoundCheck(metronome)
+    }
+
+    /// Prove, on this device and in this room, that the microphone cannot make
+    /// out the click — the one thing no filter can promise by itself. The tone is
+    /// notched out by construction, but a phone speaker also radiates a broadband
+    /// thump through the case, and whether that clears the threshold depends on
+    /// the volume, the surface under the phone and the distance to the guitar. So
+    /// measure it instead of assuming it.
+    ///
+    /// Failing closed is the point. A click the detector can hear is not noise in
+    /// the result — it lands on the beat, so it would quietly turn the take into
+    /// a perfect score.
+    private func startSoundCheck(_ metronome: Metronome) {
+        resetSoundCheck()
+        // Nothing is counted for the first second. `OnsetDetector`'s noise tracker
+        // starts cold at 0.001 and has a 2 s time constant, so during that window
+        // its threshold is the bare `silenceFloor` — far lower than it will be
+        // once the room is learned. Counting there would hold the take to a
+        // stricter standard than the grading it is supposed to gate, and refuse
+        // setups that work.
+        let warmUp = 1
+        // Twice `soundCheckMinimumOnsets` beats, not exactly that many. Sized to
+        // the minimum, the window holds precisely as many leaked clicks as the bar
+        // demands, so any room noise at all raises the bar past what the window can
+        // physically contain and real leakage passes as merely noisy. Doubling
+        // gives the leak somewhere to stand. Measured in beats and not seconds
+        // because a fixed window holds too few beats at slow tempos.
+        let needed = 2 * Double(Self.soundCheckMinimumOnsets) * metronome.beatSeconds
+        // 10 s is reached at 48 bpm, so the cap is real: without it the slowest
+        // tempo on the slider would ask for 12 s of silence.
+        let listen = Int(min(10, max(2, needed.rounded(.up))))
+        soundCheckListenSeconds = Double(listen)
+        // Set before the task, or the first rendered frame shows a countdown of 0
+        // and then animates upwards under a label saying how long to stay quiet.
+        soundCheckSecondsLeft = warmUp + listen
+        soundCheckTask = Task { @MainActor [weak self] in
+            for remaining in stride(from: warmUp + listen, through: 1, by: -1) {
+                guard let self, self.phase == .soundCheck else { return }
+                self.soundCheckSecondsLeft = remaining
+                if remaining == listen {
+                    // Warm-up over: start counting from a settled detector, and
+                    // ask the click track once whether it can be read at all. In a
+                    // quiet room over headphones nothing fires, so without a
+                    // positive probe here an engine that renders into nothing
+                    // passes the check and then grades every note as unreadable
+                    // for the rest of the session with no message.
+                    self.resetSoundCheck()
+                    self.soundCheckGridReadable =
+                        metronome.beatPhase(atHostTime: mach_absolute_time()) != nil
+                }
+                try? await Task.sleep(for: .seconds(1))
+                if Task.isCancelled { return }
+            }
+            guard let self, self.phase == .soundCheck else { return }
+            self.soundCheckSecondsLeft = 0
+            switch self.soundCheckVerdict() {
+            case .refuse(let why):
+                self.stop()
+                self.failure = why
+                return
+            case .pass(let noisy):
+                self.roomIsNoisy = noisy
+            }
+            // The check's own onsets are not the take's: leaving them in would
+            // show "notes 3 · measured 0" before a note is played, which is the
+            // published signature of a grid that can't be read.
+            self.detectedNotes = 0
+            self.phase = .grading
+        }
+    }
+
+    /// What the sound check concluded.
+    private enum SoundCheckVerdict {
+        case pass(noisy: Bool)
+        case refuse(String)
+    }
+
+    /// Read the check. A value rather than a predicate with a side effect: the
+    /// room-noise warning and the verdict are one decision, and splitting them
+    /// meant the warning could only be produced by asking why the check failed.
+    ///
+    /// Only two things are worth refusing over. A click the microphone can hear
+    /// lands on the beat, so it would be graded as a flawless note and inflate the
+    /// take — wrong, and looking right. And a room loud enough to bury the click
+    /// in its own clutter, because then neither this check nor the take can tell
+    /// one from the other. Everything between is a warning: notes the player did
+    /// not play drag the score *down* and show up in the readout, and blocking
+    /// someone out of a usable feature over a humming fridge is the worse mistake.
+    private func soundCheckVerdict() -> SoundCheckVerdict {
+        // Liveness is "did buffers arrive", not "was it loud enough". A level
+        // threshold refuses the best setup there is — a quiet room over
+        // headphones, where the microphone is working and has nothing to report.
+        guard soundCheckLevelUpdates > 0 else {
+            return .refuse("The microphone isn't picking anything up. Check that nothing is covering it and that no other app is using it.")
+        }
+        guard soundCheckGridReadable, soundCheckUnreadableRatio < 0.5 else {
+            return .refuse("Lost track of the click while checking. Start the metronome again.")
+        }
+        let heard = soundCheckPhases.count
+        guard heard >= Self.soundCheckMinimumOnsets else { return .pass(noisy: false) }
+
+        let expected = Double(heard) / Double(Self.soundCheckBins)
+        let bar = max(Double(Self.soundCheckMinimumOnsets),
+                      expected + Self.soundCheckPeakSigma * expected.squareRoot())
+        let peak = Self.peakPhaseCount(soundCheckPhases)
+        if Double(peak) >= bar {
+            return .refuse("The microphone can hear the click — \(peak) of them in step with the beat. Turn the volume down, move the phone away from the guitar, or use headphones.")
+        }
+        // Above this rate the bar itself outgrows the number of clicks the window
+        // can hold, so leakage could hide behind the noise. Refusing closes that,
+        // and a room this busy was not going to give a usable take anyway.
+        let rate = Double(heard) / max(1, soundCheckListenSeconds)
+        if rate > Self.soundCheckNoiseCeiling {
+            return .refuse("Too much going on in the room to tell your playing from the click. Somewhere quieter, or headphones.")
+        }
+        return .pass(noisy: true)
+    }
+
+    /// The most onsets sharing a point in the beat. Counted over two binnings a
+    /// half-bin apart, so a cluster sitting on a bin edge is not split in two and
+    /// read as scatter.
+    private static func peakPhaseCount(_ phases: [Double]) -> Int {
+        let bins = soundCheckBins
+        var best = 0
+        for shift in [0, 0.5 / Double(bins)] {
+            var counts = [Int](repeating: 0, count: bins)
+            for phase in phases {
+                let shifted = (phase + shift).truncatingRemainder(dividingBy: 1)
+                counts[min(bins - 1, Int(shifted * Double(bins)))] += 1
+            }
+            best = max(best, counts.max() ?? 0)
+        }
+        return best
+    }
+
+    private func resetSoundCheck() {
+        soundCheckPhases.removeAll()
+        soundCheckUnreadable = 0
+        soundCheckLevelUpdates = 0
+    }
+
+    /// Share of onsets whose grid position could not be read. A ratio and not a
+    /// count: a single unreadable onset is a transient, and everything else in the
+    /// verdict is tolerant.
+    private var soundCheckUnreadableRatio: Double {
+        let total = soundCheckPhases.count + soundCheckUnreadable
+        return total == 0 ? 0 : Double(soundCheckUnreadable) / Double(total)
     }
 
     /// Tracks the output route: it decides whether measuring is possible at all,
@@ -279,13 +560,29 @@ final class TimingCoach {
             guard self.isListening else { return }
             let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
             let deviceGone = raw.flatMap(AVAudioSession.RouteChangeReason.init(rawValue:)) == .oldDeviceUnavailable
-            // Two ways a take stops being measurable: the headphones went away,
-            // or the sound moved to the speaker (AirPlay, Control Center), where
-            // `register` grades nothing because the microphone hears the click.
-            // Both would otherwise leave the button green over a dead grader.
-            guard deviceGone || self.hearsMetronomeOverSpeaker else { return }
+            // Any change of output port invalidates the take: the sound check
+            // was run for the route it started on and says nothing about this one.
+            // Compared as a port set rather than by `hearsMetronomeOverSpeaker`,
+            // which cannot tell a Bluetooth headset from a Bluetooth speaker.
+            let ports = Self.outputPorts()
+            guard deviceGone || ports != self.checkedOutputs else { return }
+            if !deviceGone, Date() < self.routeSettlesAt {
+                self.checkedOutputs = ports   // still settling, not a switch
+                return
+            }
+            self.routeMatchesCheck = false
             self.stop()
+            self.failure = "The audio output changed — start the check again."
         }
+        #endif
+    }
+
+    /// The current output ports, by type. The sound check is pinned to this set.
+    private static func outputPorts() -> Set<String> {
+        #if os(iOS)
+        Set(AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portType.rawValue))
+        #else
+        []
         #endif
     }
 
@@ -297,6 +594,8 @@ final class TimingCoach {
         // An unknown route counts as a speaker: refusing to measure is the safe
         // side of that guess, since measuring the metronome's own click reports
         // a flawless take to someone who played nothing.
+        // Unknown counts as a speaker: it only drives advice now, and advising
+        // headphones is the harmless side of that guess.
         hearsMetronomeOverSpeaker = outputs.isEmpty || outputs.contains { $0.portType == .builtInSpeaker }
         #else
         hearsMetronomeOverSpeaker = false
@@ -311,6 +610,7 @@ final class TimingCoach {
     /// Peak level with a slow fall, so the meter doesn't flicker between buffers.
     private func updateLevel(_ peak: Float) {
         inputLevel = peak > inputLevel ? peak : inputLevel * 0.8 + peak * 0.2
+        if phase == .soundCheck { soundCheckLevelUpdates += 1 }
     }
 
     /// Grade one detected note against the metronome grid.
@@ -318,12 +618,23 @@ final class TimingCoach {
         // Onsets reach this hop by hop (analysis queue → main actor), so a note
         // detected just before the stop arrives after it. Grading it would leave
         // the take one or two notes past the summary the user is already reading.
-        guard isListening else { return }
+        guard phase != .idle else { return }
         detectedNotes += 1
-        // Over the speaker every "note" is really the metronome's own click,
-        // landing on the beat by construction. Grading those would report a
-        // flawless performance to someone who played nothing at all.
-        guard !hearsMetronomeOverSpeaker else { return }
+        if phase == .soundCheck {
+            // Heard while the player was asked to stay quiet. Only the phase is
+            // recorded; what it means is decided once, over all of them, in
+            // `soundCheckVerdict()`.
+            if let phase = metronome?.beatPhase(atHostTime: hostTime) {
+                soundCheckPhases.append(phase)
+            } else {
+                soundCheckUnreadable += 1
+            }
+            return
+        }
+        // Grade only on the route the sound check passed for. The route observer
+        // stops the take when it changes, but it runs on the same queue as this
+        // hop and may arrive second.
+        guard routeMatchesCheck else { return }
         guard let deviation = metronome?.deviation(atHostTime: hostTime) else { return }
         let hit = Hit(index: gradedNotes, deviationMs: deviation * 1000)
         hits.append(hit)
@@ -347,7 +658,7 @@ final class TimingCoach {
         let variance = max(0, takeSumOfSquares / Double(gradedNotes) - mean * mean)
         return Summary(notes: gradedNotes, onTime: takeOnTime, averageMs: mean,
                        spreadMs: variance.squareRoot(), earliestMs: takeMin,
-                       latestMs: takeMax, tape: hits)
+                       latestMs: takeMax, tape: hits, overSpeaker: hearsMetronomeOverSpeaker)
     }
 
     private func resetTake() {
@@ -409,12 +720,96 @@ final class TimingCoach {
 /// that represents room noise. A rise above both, outside the refractory window,
 /// is an onset. Both trackers are updated *after* the test so an attack never
 /// raises the bar it has to clear.
+///
+/// The only thing between this and the metronome's own click is a notch on each of
+/// `Metronome.clickTones`. Notches and not a low-pass, which was tried and
+/// measured: the click is two known frequencies while a pick attack is broadband,
+/// so cutting a region of the spectrum to remove the tones takes the attack with
+/// it. A 2.2 kHz low-pass found 2 of 16 tremolo notes, missed half of eight
+/// well-spaced single notes and missed quiet playing entirely — what survives a
+/// low-pass is the ringing fundamental, which keeps the `fast` tracker high, and
+/// the next attack can no longer clear it.
+///
+/// They cost nothing measurable: every pitch still fires within 0.02 ms, including
+/// a bend whose fundamental sits inside a notch, and fast tremolo actually stops
+/// double-triggering (22 onsets for 16 notes without them, 16 with). Five narrow
+/// slices out of an attack that spans the whole spectrum is not much to lose.
 struct OnsetDetector {
+
+    /// Notch width. A section's -3 dB bandwidth is its centre frequency divided by
+    /// this, so Q = 1 means a notch at 1 kHz is a kilohertz wide — and cascaded
+    /// two and three deep across five frequencies, that is not five slices but a
+    /// band-stop. Measured against pre-emphasis alone, Q = 1 threw away 23.9 dB
+    /// across 300 Hz-6 kHz, the band a pick attack lives in. Q = 2 halves that to
+    /// 10 dB and still rejects the click at every level; Q = 3 and above stops
+    /// rejecting it, because the notches then only remove the carrier and not the
+    /// broadband splash of the click's own attack, which is what actually fires
+    /// the detector.
+    ///
+    /// The loss that remains is roughly flat over the band, and every test here
+    /// but `silenceFloor` is a ratio, so it costs no detection: 10 of 10 pitches
+    /// at full level and at -26 dB, with or without the notches. Lowering
+    /// `silenceFloor` to "compensate" recovers nothing and only lifts the click
+    /// back towards the threshold — measured, not assumed.
+    private static let notchQ = 2.0
+
+    /// Which frequencies to notch, and how hard.
+    ///
+    /// The click's own tones are the obvious half. The other half is their
+    /// harmonics, because a small speaker driven hard distorts, and distortion of
+    /// a 1 kHz tone comes out at 2 and 3 kHz where nothing was notching it. That
+    /// is not a rounding error: on the tones alone the click survives 10%
+    /// distortion at 3.6x `silenceFloor` and fires. With the harmonics covered it
+    /// stays at 0.03x even at 20%, which is further than a phone speaker goes.
+    ///
+    /// Three sections on the tones and two on each harmonic, since the distortion
+    /// products start far weaker than the fundamental they come from.
+    private static var notchPlan: [(frequency: Double, sections: Int)] {
+        let tones = Metronome.clickTones
+        // Written out rather than dedued through a Set of products: with the
+        // current tones 3x the beat and 2x the accent are both exactly 3 kHz, but
+        // that is bit-equality between two independently computed Doubles, and
+        // retuning the tones could leave two overlapping notches at one harmonic
+        // — double the depth, in the band this Q is chosen to protect.
+        return
+        [(tones.beat, 3),         // 1000
+         (tones.accent, 3),       // 1500
+         (tones.beat * 2, 2),     // 2000 — the beat's 2nd
+         (tones.beat * 3, 2),     // 3000 — the beat's 3rd and the accent's 2nd
+         (tones.accent * 3, 2)]   // 4500 — the accent's 3rd
+    }
+
+    /// One RBJ notch section, direct form I.
+    private struct Notch {
+        private let b0: Float, b1: Float, b2: Float, a1: Float, a2: Float
+        private var x1: Float = 0, x2: Float = 0, y1: Float = 0, y2: Float = 0
+
+        init(frequency: Double, q: Double, sampleRate: Double) {
+            let w = 2 * Double.pi * frequency / sampleRate
+            let alpha = sin(w) / (2 * q)
+            let cosW = cos(w)
+            let a0 = 1 + alpha
+            b0 = Float(1 / a0)
+            b1 = Float(-2 * cosW / a0)
+            b2 = Float(1 / a0)
+            a1 = Float(-2 * cosW / a0)
+            a2 = Float((1 - alpha) / a0)
+        }
+
+        mutating func process(_ x: Float) -> Float {
+            let y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+            x2 = x1; x1 = x
+            y2 = y1; y1 = y
+            return y
+        }
+    }
 
     private var sampleRate: Double
     private var fastCoef: Float
     private var noiseCoef: Float
     private var refractory: Int
+    /// `notchSections` sections per click tone, in series.
+    private var notches: [Notch]
 
     private var fast: Float = 0
     private var noise: Float = 0.001
@@ -433,6 +828,17 @@ struct OnsetDetector {
         fastCoef = Float(1 - exp(-1 / (0.06 * sampleRate)))
         noiseCoef = Float(1 - exp(-1 / (2.0 * sampleRate)))
         refractory = Int(0.08 * sampleRate)   // 80 ms — no double-triggering on one attack
+        // A frequency at or above Nyquist cannot be notched — the coefficients
+        // would be nonsense — but it cannot be captured either, so dropping its
+        // sections loses nothing. This only ever bites the upper harmonics on a
+        // narrowband telephony route; both click tones are well inside even 8 kHz.
+        notches = Self.notchPlan
+            .filter { $0.frequency < sampleRate * 0.45 }
+            .flatMap { entry in
+                (0..<entry.sections).map { _ in
+                    Notch(frequency: entry.frequency, q: Self.notchQ, sampleRate: sampleRate)
+                }
+            }
     }
 
     /// Offsets, in samples from the start of this buffer, of the onsets found.
@@ -443,8 +849,13 @@ struct OnsetDetector {
         var onsets: [Int] = []
         for (i, sample) in samples.enumerated() {
             // Pre-emphasis: removes rumble/DC and lifts the attack over the body.
-            let magnitude = abs(sample - 0.97 * previous)
+            var value = sample - 0.97 * previous
             previous = sample
+            // `k`, not `i`: `i` is the sample offset this loop's caller appends
+            // to `onsets`, and a shadow here would turn a filter index into an
+            // onset timestamp at the head of the buffer.
+            for k in notches.indices { value = notches[k].process(value) }
+            let magnitude = abs(value)
 
             if sinceOnset < Int.max { sinceOnset += 1 }
             let threshold = max(fast * Self.riseFactor, noise * Self.noiseFactor, Self.silenceFloor)
