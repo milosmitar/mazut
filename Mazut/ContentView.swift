@@ -494,13 +494,7 @@ struct ContentView: View {
                 // Start / Stop
                 Button {
                     metronome.toggle()
-                    if metronome.isRunning {
-                        // Starting activates the session, so the route is only
-                        // known for sure now — the Listen button is gated on it.
-                        timingCoach.refreshRoute()
-                    } else {
-                        stopListeningAndReport()
-                    }
+                    if !metronome.isRunning { stopListeningAndReport() }
                 } label: {
                     Label(metronome.isRunning ? "Stop" : "Start",
                           systemImage: metronome.isRunning ? "stop.fill" : "play.fill")
@@ -562,19 +556,10 @@ struct ContentView: View {
             } else if timingCoach.isListening {
                 timingReadout
             } else {
-                VStack(spacing: 4) {
-                    Text("Play along with the click and each note gets measured against it. It listens for a few seconds first, to check it can't hear the click itself.")
-                    // Advice, not a gate: drums have no tone to notch out, so
-                    // over a speaker the sound check will refuse them. Saying so
-                    // up front beats letting the check explain it afterwards.
-                    if metronome.sound == .drums, timingCoach.hearsMetronomeOverSpeaker {
-                        Label("With Drums that needs headphones.", systemImage: "headphones")
-                            .foregroundStyle(.orange)
-                    }
-                }
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+                Text("Play along with the click and each note gets measured against it. It listens for a few seconds first to learn how the click sounds in the room, so it can tell it apart from you.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
             }
         }
     }
@@ -585,7 +570,7 @@ struct ContentView: View {
     /// a check could pass.
     private var soundCheckNotice: some View {
         VStack(spacing: 6) {
-            Label("Stay quiet — checking whether the microphone can hear the click.",
+            Label("Stay quiet — learning how the click sounds in this room.",
                   systemImage: "ear")
                 .font(.caption)
                 .multilineTextAlignment(.center)
@@ -611,17 +596,6 @@ struct ContentView: View {
             // Shows the microphone is actually hearing something, so "no
             // readings" can be told apart from "no signal".
             inputMeter
-
-            if timingCoach.roomIsNoisy {
-                // The check heard things, but scattered rather than in step with
-                // the beat — so not the click. Measuring works; it will just
-                // count some of the room as notes.
-                Label("The room isn't silent — some of what gets measured may not be you.",
-                      systemImage: "exclamationmark.triangle")
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
-                    .multilineTextAlignment(.center)
-            }
 
             if let hit = timingCoach.lastHit {
                 Text(deviationText(hit.deviationMs))
@@ -657,7 +631,12 @@ struct ContentView: View {
         let rate = timingCoach.inputSampleRate > 0
             ? "\(Int((timingCoach.inputSampleRate / 1000).rounded())) kHz"
             : "no input"
-        return "mic \(rate) · notes \(timingCoach.detectedNotes) · measured \(timingCoach.gradedNotes)"
+        // The echo line is what a screenshot of a bad take has to answer: was the
+        // click being removed, and what latency came off every note.
+        let latency = timingCoach.measuredLatencyMs.map { "latency \(Int($0.rounded())) ms" }
+            ?? "latency not measured"
+        let echo = timingCoach.clickIsCancelled ? "click removed · \(latency)" : "click not removed"
+        return "mic \(rate) · notes \(timingCoach.detectedNotes) · measured \(timingCoach.gradedNotes) · \(echo)"
     }
 
     /// "+18 ms · late" — sign included, so early/late is readable at a glance.
