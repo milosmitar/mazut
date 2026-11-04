@@ -116,10 +116,14 @@ private struct LearningFolderView: View {
 
     var body: some View {
         Group {
-            if subfolders.isEmpty && clips.isEmpty {
+            // The root always lists, since it always has the practice drills.
+            if subfolders.isEmpty && clips.isEmpty && !path.isEmpty {
                 emptyState
             } else {
                 List {
+                    if path.isEmpty {
+                        practiceSection
+                    }
                     if !subfolders.isEmpty {
                         Section("Folders") {
                             ForEach(subfolders) { sub in
@@ -150,14 +154,8 @@ private struct LearningFolderView: View {
                 .scrollContentBackground(.hidden)
             }
         }
-        .navigationTitle(folder?.name ?? "Folder")
-        .navigationBarTitleDisplayMode(path.isEmpty ? .large : .inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) { addMenu }
-            if !clips.isEmpty {
-                ToolbarItem(placement: .topBarTrailing) { EditButton() }
-            }
-        }
+        .modifier(FolderChrome(isRoot: path.isEmpty, title: folder?.name ?? "Folder",
+                               addMenu: addMenu, showsEdit: !clips.isEmpty))
         .alert("New Folder", isPresented: $showNewSubfolderAlert) {
             TextField("Name", text: $newSubfolderName)
             Button("Cancel", role: .cancel) {}
@@ -244,13 +242,50 @@ private struct LearningFolderView: View {
         }
     }
 
+    /// Built-in drills, above the user's own folders on the root only.
+    private var practiceSection: some View {
+        Section {
+            NavigationLink {
+                ChordsView()
+            } label: {
+                row("Chords", "Tap a chord to see how it is fingered",
+                    systemImage: "hand.raised.fingers.spread")
+            }
+            NavigationLink {
+                CircleOfFifthsView()
+            } label: {
+                row("Circle of Fifths", "Keys, their signatures and the chords in each",
+                    systemImage: "circle.circle")
+            }
+            NavigationLink {
+                ScalesView()
+            } label: {
+                row("Scales", "Every position of a scale, in any key",
+                    systemImage: "chart.bar.xaxis")
+            }
+            NavigationLink {
+                NoteTrainerView()
+            } label: {
+                row("Find the Note", "Play the note the app names, on the string it names",
+                    systemImage: "guitars")
+            }
+        } header: {
+            Text("Practice")
+        } footer: {
+            if subfolders.isEmpty && clips.isEmpty {
+                Text("Add your own folders, videos, photos, documents or YouTube links with +.")
+            }
+        }
+    }
+
+    /// Subfolders only — the root always lists, for its practice section.
     private var emptyState: some View {
         VStack(spacing: 16) {
             Spacer()
-            Image(systemName: path.isEmpty ? "graduationcap" : "tray")
+            Image(systemName: "tray")
                 .font(.system(size: 48))
                 .foregroundStyle(.secondary)
-            Text(path.isEmpty ? "Nothing here yet" : "Empty folder")
+            Text("Empty folder")
                 .font(.headline)
             Text("Add a subfolder, or a video, photo, document, or YouTube link.")
                 .font(.subheadline)
@@ -263,12 +298,17 @@ private struct LearningFolderView: View {
     }
 
     private func subfolderRow(_ sub: LearningFolder) -> some View {
+        row(sub.name, summary(sub), systemImage: "folder.fill")
+    }
+
+    /// Icon, title and a line under it — folders and practice drills alike.
+    private func row(_ title: String, _ subtitle: String, systemImage: String) -> some View {
         HStack(spacing: 12) {
-            Image(systemName: "folder.fill")
+            Image(systemName: systemImage)
                 .foregroundStyle(Color.accentColor)
             VStack(alignment: .leading, spacing: 2) {
-                Text(sub.name).font(.body)
-                Text(summary(sub))
+                Text(title).font(.body)
+                Text(subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -592,3 +632,32 @@ private struct DocumentPreview: View {
     }
 }
 #endif
+
+
+/// Title + toolbar of a folder screen: the App Store–style tab header on the
+/// root (with the menu button), a plain inline bar on subfolders.
+private struct FolderChrome<AddMenu: View>: ViewModifier {
+    let isRoot: Bool
+    let title: String
+    let addMenu: AddMenu
+    let showsEdit: Bool
+
+    func body(content: Content) -> some View {
+        if isRoot {
+            content.tabHeader(title) {
+                addMenu
+                if showsEdit { EditButton() }
+            }
+        } else {
+            content
+                .navigationTitle(title)
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) { addMenu }
+                    if showsEdit {
+                        ToolbarItem(placement: .topBarTrailing) { EditButton() }
+                    }
+                }
+        }
+    }
+}

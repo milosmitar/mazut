@@ -68,9 +68,21 @@ final class Tuner {
     private(set) var cents: Double = 0
     /// Microphone permission denied → UI shows instructions.
     private(set) var permissionDenied = false
+    /// Why the microphone isn't listening although it was asked to — it couldn't
+    /// open, or a call took the audio. Without it a listener waits forever.
+    private(set) var failure: String?
 
     /// Selected tuning (chosen by the UI; only affects the display of target strings).
     var tuning: GuitarTuning = .standard
+
+    /// Every smoothed reading as it is published — `nil` while there is no usable
+    /// tone — with the newest buffer's RMS level. For listeners that need each
+    /// reading rather than the latest state: the note trainer counts how long a
+    /// note has been held, and tells a fresh pluck from a ringing string by the
+    /// level jumping.
+    @ObservationIgnored var onReading: ((_ midi: Int?, _ cents: Double, _ level: Float) -> Void)?
+    /// Called when the microphone stops on its own — see `failure`.
+    @ObservationIgnored var onFailure: (() -> Void)?
 
     /// Note name without octave, for the large display, e.g. "E", "A#".
     var noteName: String { Tuner.noteName(forMidi: midiNote) }
@@ -80,6 +92,11 @@ final class Tuner {
     // MARK: Audio graph
 
     private let engine = AVAudioEngine()
+    /// Set between `start()` and the capture beginning; cleared by `stop()`, so a
+    /// stop during the permission prompt is not lost and a second start does not
+    /// install a second tap (which AVAudioEngine answers with a crash).
+    @ObservationIgnored private var startRequested = false
+    @ObservationIgnored private var interruptionObserver: NSObjectProtocol?
     /// Separate queue for YIN analysis — so DSP doesn't run on the audio I/O thread.
     nonisolated private let analysisQueue = DispatchQueue(label: "com.tarmi.Mazut.tuner")
     /// The last few frequencies for median smoothing (suppresses "octave jumps").
@@ -98,19 +115,29 @@ final class Tuner {
     func toggle() { isRunning ? stop() : start() }
 
     func start() {
-        guard !isRunning else { return }
+        guard !isRunning, !startRequested else { return }
+        // Cleared now, not after the async permission check: a failure from the
+        // last session would otherwise still show (and offer Resume) meanwhile.
+        failure = nil
+        startRequested = true
         Task { @MainActor [weak self] in
             guard let self else { return }
             guard await Tuner.requestMicPermission() else {
+                self.startRequested = false
                 self.permissionDenied = true
                 return
             }
             self.permissionDenied = false
+            guard self.startRequested else { return }   // stopped while asking
+            self.startRequested = false
             self.beginCapture()
         }
     }
 
-    func stop() {
+    func stop(afterInterruption: Bool = false) {
+        startRequested = false
+        if let interruptionObserver { NotificationCenter.default.removeObserver(interruptionObserver) }
+        interruptionObserver = nil
         guard isRunning else { return }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
@@ -118,17 +145,33 @@ final class Tuner {
         hasSignal = false
         history.removeAll()
         analysisQueue.async { [weak self] in self?.ring.removeAll(keepingCapacity: true) }
-        #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-        #endif
+        restoreSession(afterInterruption: afterInterruption)
+    }
+
+    /// Back to plain playback. Stays active if a song started while the
+    /// microphone was open (play on the lock screen ends a drill) — deactivating
+    /// would cut it off; otherwise deactivates so other apps can resume.
+    private func restoreSession(afterInterruption: Bool = false) {
+        AudioSessionHandoff.restorePlayback(keepActive: StemMixerEngine.shared.isPlaying,
+                                            afterInterruption: afterInterruption)
+    }
+
+    private func fail(_ message: String) {
+        failure = message
+        onFailure?()
     }
 
     private func beginCapture() {
+        failure = nil
         configureSession()
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
         let sr = format.sampleRate
-        guard sr > 0 else { return }
+        guard sr > 0 else {
+            restoreSession()
+            fail("Couldn't open the microphone. Check that no other app is using it.")
+            return
+        }
 
         analysisQueue.async { [weak self] in self?.ring.removeAll(keepingCapacity: true) }
         input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
@@ -142,7 +185,9 @@ final class Tuner {
                 }
                 guard self.ring.count >= Self.windowSamples else { return }
                 let freq = Tuner.detectPitch(self.ring, sampleRate: sr)
-                Task { @MainActor in self.apply(freq) }
+                var level: Float = 0
+                vDSP_rmsqv(samples, 1, &level, vDSP_Length(samples.count))
+                Task { @MainActor in self.apply(freq, level: level) }
             }
         }
 
@@ -150,15 +195,41 @@ final class Tuner {
         do {
             try engine.start()
             isRunning = true
+            observeInterruptions()
         } catch {
             print("Tuner start error: \(error)")
             input.removeTap(onBus: 0)
+            restoreSession()
+            fail("Couldn't open the microphone. Check that no other app is using it.")
         }
     }
 
+    /// A call or Siri takes the input and stops the engine without saying so to
+    /// anyone listening for readings.
+    private func observeInterruptions() {
+        #if os(iOS)
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, self.isRunning,
+                  let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  AVAudioSession.InterruptionType(rawValue: raw) == .began else { return }
+            self.stop(afterInterruption: true)
+            self.fail("The audio was interrupted, so the microphone stopped.")
+        }
+        #endif
+    }
+
     /// Apply a new (raw) frequency: smoothing + mapping to a note.
-    private func apply(_ freq: Double) {
-        guard freq > 0 else { hasSignal = false; return }
+    private func apply(_ freq: Double, level: Float) {
+        // Readings already on their way when `stop()` ran would otherwise refill
+        // the history and report a tone on a stopped tuner.
+        guard isRunning else { return }
+        guard freq > 0 else {
+            hasSignal = false
+            onReading?(nil, 0, level)
+            return
+        }
         history.append(freq)
         if history.count > 5 { history.removeFirst() }
         let f = Tuner.median(history)
@@ -167,6 +238,7 @@ final class Tuner {
         midiNote = midi
         cents = c
         hasSignal = true
+        onReading?(midi, c, level)
     }
 
     // MARK: Permission + session

@@ -67,13 +67,6 @@ struct TimingSummarySheet: View {
             Divider()
             statRow("Range", "\(Self.signed(summary.earliestMs)) … \(Self.signed(summary.latestMs)) ms",
                     note: "Earliest and latest note of the take.")
-            if summary.clickRemoved {
-                Divider()
-                // How the take was measured is the one thing the reader cannot
-                // see in the numbers above, so it is said.
-                statRow("Click", "removed",
-                        note: "The metronome's echo was subtracted from what the microphone heard.")
-            }
         }
         .padding(.vertical, 4)
         .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 12))
@@ -123,7 +116,7 @@ struct TimingSummarySheet: View {
 private extension TimingCoach.Summary {
     /// A take built from deviations alone, so a preview reads like real playing
     /// rather than like numbers picked to fill the fields.
-    static func preview(_ ms: [Double], clickRemoved: Bool = false) -> TimingCoach.Summary {
+    static func preview(_ ms: [Double]) -> TimingCoach.Summary {
         let mean = ms.reduce(0, +) / Double(ms.count)
         let variance = ms.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(ms.count)
         return TimingCoach.Summary(
@@ -133,8 +126,7 @@ private extension TimingCoach.Summary {
             spreadMs: variance.squareRoot(),
             earliestMs: ms.min() ?? 0,
             latestMs: ms.max() ?? 0,
-            tape: ms.enumerated().map { TimingCoach.Hit(index: $0.offset, deviationMs: $0.element) },
-            clickRemoved: clickRemoved)
+            tape: ms.enumerated().map { TimingCoach.Hit(index: $0.offset, deviationMs: $0.element) })
     }
 }
 
@@ -151,5 +143,5 @@ private extension TimingCoach.Summary {
 // problem from a small average with a large one, and the sheet has to show that.
 #Preview("Dragging, but steady") {
     TimingSummarySheet(summary: .preview(
-        [38, 44, 41, 36, 47, 39, 43, 40, 45, 37, 42, 46], clickRemoved: true))
+        [38, 44, 41, 36, 47, 39, 43, 40, 45, 37, 42, 46]))
 }

@@ -39,7 +39,7 @@ struct TabBackgroundView: View {
                 .aspectRatio(contentMode: .fill)
                 .frame(width: geo.size.width, height: geo.size.height)
                 .clipped()
-                .blur(radius: 6)
+                .blur(radius: 4)
                 .overlay {
                     LinearGradient(
                         colors: [
@@ -153,6 +153,8 @@ struct ContentView: View {
                 .tabItem { Label("Metronome", systemImage: "metronome") }
                 .tag(2)
             LearningTab()
+                // For the practice drills, which silence it before listening.
+                .environment(metronome)
                 .tabItem { Label("Learning", systemImage: "graduationcap") }
                 .tag(3)
             // tunerTab
@@ -180,7 +182,7 @@ struct ContentView: View {
                     if library.isEmpty { emptyState } else { libraryView }
                 }
             }
-            .navigationTitle("Mazut")
+            .tabHeader("Mazut", showsMenu: true)
         }
     }
 
@@ -317,16 +319,14 @@ struct ContentView: View {
                 TabBackgroundView()
                 playlistsContent
             }
-            .navigationTitle("Playlists")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        newPlaylistName = ""
-                        showNewPlaylistAlert = true
-                    } label: {
-                        Image(systemName: "plus")
-                    }
+            .tabHeader("Playlists") {
+                Button {
+                    newPlaylistName = ""
+                    showNewPlaylistAlert = true
+                } label: {
+                    Image(systemName: "plus")
                 }
+                .accessibilityLabel("New Playlist")
             }
             .alert("New Playlist", isPresented: $showNewPlaylistAlert) {
                 TextField("Name", text: $newPlaylistName)
@@ -409,7 +409,7 @@ struct ContentView: View {
                 TabBackgroundView()
                 metronomeContent
             }
-            .navigationTitle("Metronome")
+            .tabHeader("Metronome")
         }
         .sheet(item: $timingSummary) { summary in
             TimingSummarySheet(summary: summary)
@@ -500,7 +500,7 @@ struct ContentView: View {
                           systemImage: metronome.isRunning ? "stop.fill" : "play.fill")
                         .font(.title3.bold())
                         .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
+                        .padding(.vertical, 8)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(metronome.isRunning ? .red : .accentColor)
@@ -509,7 +509,8 @@ struct ContentView: View {
                 timingSection
                     .padding(.horizontal)
             }
-            .padding()
+            .padding(.horizontal)
+            
         }
         .scrollBounceBehavior(.basedOnSize)
         .animation(.easeInOut(duration: 0.2), value: metronome.sound)
@@ -518,10 +519,9 @@ struct ContentView: View {
 
     // MARK: - Timing check (microphone)
 
-    /// Grades what you play against the click grid, on any route. The click moves
-    /// to a tone the detector is notched deaf to, and every take opens with a
-    /// sound check that proves the microphone can't make it out — so there is
-    /// nothing for the UI to gate on beyond the metronome actually running.
+    /// Grades what you play against the click grid. Headphones only: the coach
+    /// refuses a speaker route itself, so the UI gates on nothing beyond the
+    /// metronome actually running, and says up front what it needs.
     private var timingSection: some View {
         VStack(spacing: 10) {
             Button {
@@ -531,11 +531,13 @@ struct ContentView: View {
                     timingCoach.start(metronome: metronome)
                 }
             } label: {
-                Label(timingCoach.isListening ? "Stop listening" : "Check my timing",
+                Label(timingCoach.isListening
+                        ? (timingCoach.mode == .calibration ? "Cancel calibration" : "Stop listening")
+                        : "Check my timing",
                       systemImage: timingCoach.isListening ? "waveform" : "mic")
                     .font(.subheadline.bold())
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
+                    .padding(.vertical, 8)
             }
             .buttonStyle(.bordered)
             .tint(timingCoach.isListening ? .green : .accentColor)
@@ -551,39 +553,75 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
                     .multilineTextAlignment(.center)
-            } else if timingCoach.phase == .soundCheck {
-                soundCheckNotice
             } else if timingCoach.isListening {
-                timingReadout
+                if timingCoach.mode == .calibration { calibrationReadout } else { timingReadout }
             } else {
-                Text("Play along with the click and each note gets measured against it. It listens for a few seconds first to learn how the click sounds in the room, so it can tell it apart from you.")
+                Label("Put on headphones, then play along with the click — each note gets measured against it.",
+                      systemImage: "headphones")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
             }
+
+            if !timingCoach.isListening {
+                calibrationRow
+            }
         }
     }
 
-    /// The sound check only means anything if the player really does stay quiet,
-    /// so the countdown is the instruction rather than decoration — and the input
-    /// meter stays visible, since a microphone reading zero is the other reason
-    /// a check could pass.
-    private var soundCheckNotice: some View {
+    /// Headphones (Bluetooth above all) add delay the system doesn't report, so
+    /// every note would read late by the same amount. Calibrating measures it
+    /// once per pair of headphones and takes it off every note.
+    private var calibrationRow: some View {
         VStack(spacing: 6) {
-            Label("Stay quiet — learning how the click sounds in this room.",
-                  systemImage: "ear")
-                .font(.caption)
-                .multilineTextAlignment(.center)
-            Text("\(timingCoach.soundCheckSecondsLeft)")
-                .font(.largeTitle.bold().monospacedDigit())
-                .contentTransition(.numericText(countsDown: true))
-                .animation(.easeOut(duration: 0.2), value: timingCoach.soundCheckSecondsLeft)
-            inputMeter
+            if let message = timingCoach.calibrationMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                    .multilineTextAlignment(.center)
+            } else if let calibration = timingCoach.currentCalibration {
+                let value = Int(calibration.offsetMs.rounded())
+                Text("\(calibration.routeName): calibrated, \(value > 0 ? "+" : "")\(value) ms")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Every note reads late by about the same amount? Calibrate your headphones.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            HStack(spacing: 16) {
+                Button {
+                    timingCoach.start(metronome: metronome, calibrate: true)
+                } label: {
+                    Label(timingCoach.currentCalibration == nil ? "Calibrate headphones" : "Recalibrate",
+                          systemImage: "dial.medium")
+                }
+                if timingCoach.currentCalibration != nil {
+                    Button("Reset", role: .destructive) { timingCoach.resetCalibration() }
+                }
+            }
+            .font(.caption.bold())
+            .buttonStyle(.borderless)
+            .disabled(!metronome.isRunning)
         }
     }
 
-    /// Shared by the sound check and the live readout: a microphone reading zero
-    /// is how a dead microphone shows itself in both, so the two must not drift.
+    private var calibrationReadout: some View {
+        VStack(spacing: 8) {
+            inputMeter
+            Text("Play short, sharp notes exactly on the click")
+                .font(.subheadline)
+            ProgressView(value: Double(timingCoach.calibrationCount),
+                         total: Double(TimingCoach.calibrationNotes + TimingCoach.calibrationLeadIn))
+                .frame(maxWidth: 200)
+            Text("\(timingCoach.calibrationCount) / \(TimingCoach.calibrationNotes + TimingCoach.calibrationLeadIn) notes")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// A microphone reading zero is how a dead microphone shows itself.
     private var inputMeter: some View {
         ProgressView(value: Double(min(timingCoach.inputLevel * 3, 1)))
             .progressViewStyle(.linear)
@@ -631,12 +669,12 @@ struct ContentView: View {
         let rate = timingCoach.inputSampleRate > 0
             ? "\(Int((timingCoach.inputSampleRate / 1000).rounded())) kHz"
             : "no input"
-        // The echo line is what a screenshot of a bad take has to answer: was the
-        // click being removed, and what latency came off every note.
-        let latency = timingCoach.measuredLatencyMs.map { "latency \(Int($0.rounded())) ms" }
-            ?? "latency not measured"
-        let echo = timingCoach.clickIsCancelled ? "click removed · \(latency)" : "click not removed"
-        return "mic \(rate) · notes \(timingCoach.detectedNotes) · measured \(timingCoach.gradedNotes) · \(echo)"
+        // The output figure is the one correction nobody checks: if every note
+        // reads late by the same amount on Bluetooth, this is where to look.
+        let output = timingCoach.outputLatencyMs.map { " · output \(Int($0.rounded())) ms" } ?? ""
+        let calibrated = timingCoach.appliedOffsetMs != 0
+            ? " · calibrated \(Int(timingCoach.appliedOffsetMs.rounded())) ms" : ""
+        return "mic \(rate) · notes \(timingCoach.detectedNotes) · measured \(timingCoach.gradedNotes)\(output)\(calibrated)"
     }
 
     /// "+18 ms · late" — sign included, so early/late is readable at a glance.

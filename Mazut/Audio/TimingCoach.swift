@@ -10,34 +10,16 @@
 //  sharp rise above the recent level, which is enough for anything percussive or
 //  plucked and costs a fraction of a spectral-flux analysis.
 //
-//  The hard part is the metronome itself. Over a speaker the microphone hears the
-//  click, and a detector that can hear it reports a flawless performance to
-//  someone who played nothing — the click lands on the beat by construction.
-//
-//  This used to be fought by *filtering*: notches on the click's tones, and a
-//  sound check counting onsets to prove the filter held. Both failed on a real
-//  phone, and the reasons are worth keeping. The click does not reach the
-//  microphone as two tones; it arrives through the body of the phone as a thump,
-//  a cabinet ring and a rattle, none of which sit at the notches. And counting
-//  onsets cannot measure that leak, because the detector is adaptive: during the
-//  check its noise tracker settles on the periodic click and goes partly deaf to
-//  it, the count comes out low, the check passes — and the click comes back the
-//  moment the player pauses. On a device it showed up as a dead-flat row of
-//  "notes" at +49 ms.
-//
-//  So the leak is now *learned*, not modelled. The click is a loop: every bar is
-//  bit-identical, and so is everything the room does to it. While the player
-//  stays quiet the coach records two bars and averages them sample by sample in
-//  the microphone's own clock, which yields the exact echo — thump, ring, rattle,
-//  distortion, drums included. During the take that echo is subtracted before the
-//  detector sees anything. See `ClickLearner` and `ClickCanceller`.
-//
-//  The same recording measures the latency. The echo is a note played perfectly in
-//  time by the phone itself, so wherever it lands against the grid is the error of
-//  the whole loop — output, air, microphone, buffering — that the system's own
-//  latency figures leave out. That was the flat +49 ms, and it biased every note
-//  the player played by the same amount. It comes off every measurement. See
-//  `measureEcho`.
+//  Headphones only. Over a speaker the microphone hears the click, and a
+//  detector that can hear it reports a flawless performance to someone who
+//  played nothing — the click lands on the beat by construction. Two ways of
+//  telling it apart from the player were tried and dropped after failing on a
+//  real phone: notch filters on the click's tones (the click reaches the
+//  microphone through the phone's body as a thump and a rattle, nowhere near the
+//  notches), and learning the click's echo during a quiet countdown and
+//  subtracting it (too fragile in practice — every volume step, route settle or
+//  stray sound in the countdown ended the take). With headphones there is nothing
+//  to remove, so the coach refuses to start when the click goes to a speaker.
 //
 
 import AVFoundation
@@ -74,10 +56,6 @@ final class TimingCoach {
         let latestMs: Double
         /// The tail of the take, for the chart.
         let tape: [Hit]
-        /// Whether the click's echo was subtracted from the recording — i.e. the
-        /// click was reaching the microphone. The sheet says so, since it is the
-        /// one thing about how a take was measured that a reader could not see.
-        let clickRemoved: Bool
 
         var accuracy: Double { notes > 0 ? Double(onTime) / Double(notes) : 0 }
     }
@@ -86,66 +64,63 @@ final class TimingCoach {
     /// verdict; everything else is an interruption.
     enum StopReason { case user, interrupted }
 
-    /// What the microphone is doing. Every take opens with `soundCheck`, where the
-    /// click's echo is recorded and learned and nothing is graded — on every route,
-    /// since whether the click reaches the microphone is measured, never guessed
-    /// from a port type.
-    enum Phase { case idle, soundCheck, grading }
+    /// A normal graded take, or measuring the headphones' hidden latency.
+    enum Mode { case take, calibration }
+
+    /// The stored latency correction for the current headphones.
+    struct Calibration: Equatable {
+        let routeName: String
+        let offsetMs: Double
+    }
 
     /// A note inside this window counts as on the beat.
     static let toleranceMs = 25.0
-    /// Seconds before recording starts, for the route and the session to settle.
-    private static let warmUpSeconds = 1
-    /// Where to look for each beat's echo, around the beat. Mostly after it —
-    /// that is where the uncompensated latency puts it — and a little before, in
-    /// case the system over-reports its latency instead. Not further back than
-    /// this: at a fast 16th-note groove the previous step's echo would be in reach.
-    private static let echoSearchBefore = 0.02
-    private static let echoSearchAfter = 0.15
-    /// An echo counts as heard when its peak stands this far above the peak of
-    /// the two bars' *difference* in the same window. The difference is the room
-    /// noise and nothing else, at the same level as the noise left in the average,
-    /// so in silence the ratio sits near 1. Peaks rather than the window's energy:
-    /// a 30 ms echo in a 170 ms window is diluted by everything around it, and in
-    /// a noisier room an echo plain to see failed an energy test. Measured: no
-    /// echo invented in 240 silent recordings across four noise levels.
-    private static let echoOverNoise: Float = 2.5
-    private static let echoMinimum: Float = 0.002
-    /// Beats' echoes must agree on the latency to within this. A real echo is the
-    /// same physical path every beat; scatter means there was no echo to measure.
-    private static let echoConsistency = 0.003
-    /// How long, and how quiet relative to the echo's peak, the moment before an
-    /// echo's rise must be. See `measureEcho`.
-    private static let echoQuietBefore = 0.003
-    private static let echoQuietLevel: Float = 0.15
-    /// How far the output volume may move from where the echo was learned before
-    /// the take is stopped. Either way matters now: the subtracted echo is fixed,
-    /// so the room getting louder leaves some of the click behind, and getting
-    /// quieter subtracts more than is there — a negative echo of the same shape.
-    /// One hardware step is 1/16, so this is a nudge.
-    private static let volumeTolerance: Float = 0.05
+    /// Seconds after the microphone opens before notes count. Engaging the input
+    /// renegotiates the route (an A2DP headset has no input side), and the route
+    /// is only judged once that has settled.
+    private static let warmUpSeconds = 1.0
+    /// No microphone audio for this long means the capture died under the take.
+    /// Longer than a Bluetooth renegotiation's gap, far shorter than a player
+    /// takes to notice a dead readout.
+    private static let stallSeconds = 1.5
     /// Below this a take is too short to say anything about.
     private static let minimumNotesForSummary = 4
     /// How many notes the chart keeps.
     static let historyLimit = 32
+    /// Notes collected in a calibration run, and how many of the first ones are
+    /// thrown away while the player locks onto the click.
+    static let calibrationNotes = 16
+    static let calibrationLeadIn = 4
+    /// Calibration is refused when the notes scatter more than this (median
+    /// absolute deviation): the offset would be a guess.
+    private static let calibrationMaxScatterMs = 15.0
+    /// A real route's hidden latency stays well under this; beyond it the notes
+    /// were most likely landing on the wrong click.
+    private static let calibrationMaxOffsetMs = 200.0
+    private static let calibrationStoreKey = "timingLatencyOffsets"
+    /// Click-echo guard: among the last `echoWindow` notes, `echoHits` or more
+    /// inside a `echoSpreadMs` band means the microphone is hearing the click —
+    /// it arrives at the same delay every beat, which no player manages.
+    private static let echoWindow = 16
+    private static let echoHits = 12
+    private static let echoSpreadMs = 3.0
+
     /// How many of the most recent notes the score is computed over — shorter
     /// than the chart, so the percentage reacts to what is being played now.
     private static let scoreWindow = 16
 
     // MARK: Public state (observed by the UI)
 
-    private(set) var phase: Phase = .idle
-    /// The microphone is open — in either phase.
-    var isListening: Bool { phase != .idle }
-    /// Seconds left of the sound check, for the "stay quiet" countdown.
-    private(set) var soundCheckSecondsLeft = 0
-    /// The round-trip latency measured off the click's echo, in ms, or nil when
-    /// no echo reached the microphone (headphones, a very quiet speaker) and there
-    /// was nothing to measure it with. Shown, because it is the number that says
-    /// whether the readings can be trusted.
-    private(set) var measuredLatencyMs: Double?
-    /// Whether the click's echo is being subtracted from the microphone.
-    private(set) var clickIsCancelled = false
+    private(set) var isListening = false
+    /// What the current (or last) listening session is for.
+    private(set) var mode: Mode = .take
+    /// Notes collected so far in a calibration run (lead-in included).
+    private(set) var calibrationCount = 0
+    /// Shown after a successful calibration.
+    private(set) var calibrationMessage: String?
+    /// The stored correction for the headphones currently connected, nil when
+    /// they have never been calibrated. Refreshed on every route change.
+    private(set) var currentCalibration: Calibration?
     /// Microphone permission denied → the UI shows instructions.
     private(set) var permissionDenied = false
     /// Why the last start attempt didn't take, for the UI to show.
@@ -185,6 +160,12 @@ final class TimingCoach {
     /// the next note's x position on the chart — they are the same number.
     private(set) var gradedNotes = 0
     private(set) var inputSampleRate: Double = 0
+    /// The output latency the system reports, in ms — the one figure every note
+    /// is corrected by and nothing checks. Shown, so a take where every note is
+    /// "late" by the same amount on Bluetooth can be read for what it is.
+    private(set) var outputLatencyMs: Double?
+    /// The calibrated correction applied to this take, in ms (0 = none).
+    private(set) var appliedOffsetMs: Double = 0
 
     // Running totals for the whole take (`hits` only keeps the last 32).
     @ObservationIgnored private var takeOnTime = 0
@@ -192,6 +173,12 @@ final class TimingCoach {
     @ObservationIgnored private var takeSumOfSquares = 0.0
     @ObservationIgnored private var takeMin = 0.0
     @ObservationIgnored private var takeMax = 0.0
+    /// Raw deviations collected by a calibration run.
+    @ObservationIgnored private var calibrationSamples: [Double] = []
+    /// Raw deviations of the most recent notes, for the click-echo guard.
+    @ObservationIgnored private var recentRaw: [Double] = []
+    /// The route the take/calibration runs on, fixed once it has settled.
+    @ObservationIgnored private var routeKey: String?
 
     // MARK: Audio graph
 
@@ -207,36 +194,23 @@ final class TimingCoach {
     /// attacks that land in the buffers between two publishes.
     @ObservationIgnored nonisolated(unsafe) private var pendingPeak: Float = 0
     @ObservationIgnored private var routeObserver: NSObjectProtocol?
+    @ObservationIgnored private var interruptionObserver: NSObjectProtocol?
     /// Set between the button tap and `beginCapture()`; cleared by `stop()` so a
     /// cancel during the permission prompt doesn't start capturing afterwards.
     @ObservationIgnored private var startRequested = false
-    /// The output ports the sound check passed for. Notes are graded only while
-    /// the route still matches — the check says nothing about any other one.
-    @ObservationIgnored private var checkedOutputs: Set<String> = []
-    /// Until when a route change counts as the session still settling.
-    @ObservationIgnored private var routeSettlesAt = Date.distantPast
-    /// Output volume the check was passed at, and the watch that enforces it.
-    ///
-    /// The route was pinned from the start, but volume is the variable that
-    /// actually governs leakage — the refusal message says "turn the volume down"
-    /// in as many words. Nothing posts a route change when the volume keys are
-    /// pressed, so without this a take that passed quietly could be turned up
-    /// afterwards and go straight back to grading the metronome's own click as a
-    /// flawless performance.
-    @ObservationIgnored private var checkedVolume: Float = 0
-    @ObservationIgnored private var volumeObserver: NSKeyValueObservation?
-    @ObservationIgnored private var interruptionObserver: NSObjectProtocol?
-    /// Taken off every deviation; see `measureEcho`.
-    @ObservationIgnored private var latencyCorrection: Double = 0
-    /// Touched ONLY from `analysisQueue`: the recording in progress, and the
-    /// learned echo once there is one.
-    @ObservationIgnored nonisolated(unsafe) private var learner: ClickLearner?
-    @ObservationIgnored nonisolated(unsafe) private var canceller: ClickCanceller?
-    @ObservationIgnored private var soundCheckTask: Task<Void, Never>?
+    /// The route is still settling after the input was engaged: route changes
+    /// are ignored and notes are not graded. Cleared by `watchTask`, which then
+    /// judges the settled route.
+    @ObservationIgnored private var settling = false
+    /// Judges the route after the warm-up, then watches for the audio stopping.
+    @ObservationIgnored private var watchTask: Task<Void, Never>?
+    /// When the microphone's audio last reached the main actor.
+    @ObservationIgnored private var lastAudioAt = Date()
     private weak var metronome: Metronome?
 
     init() {
         observeRouteChanges()
+        refreshCalibration()
     }
 
     deinit {
@@ -246,8 +220,19 @@ final class TimingCoach {
 
     // MARK: Control
 
-    func start(metronome: Metronome) {
+    /// Start a graded take, or — with `calibrate` — a run that measures the
+    /// latency the system doesn't report (Bluetooth codecs mostly) and stores it
+    /// for the current headphones.
+    func start(metronome: Metronome, calibrate: Bool = false) {
         guard !isListening else { return }
+        mode = calibrate ? .calibration : .take
+        calibrationMessage = nil
+        // Refused before the microphone opens: engaging it only to tear it down
+        // a second later flashes the readout and glitches the click.
+        guard !Self.clickGoesToSpeaker() else {
+            failure = Self.needsHeadphones
+            return
+        }
         self.metronome = metronome
         startRequested = true
         Task { @MainActor [weak self] in
@@ -264,37 +249,33 @@ final class TimingCoach {
 
     /// Stop listening, returning the take's summary when the user ended it and
     /// enough notes were measured — nil for every other reason. The rule lives
-    /// here rather than at the call site: `stop()` runs on four paths (button,
+    /// here rather than at the call site: `stop()` runs on several paths (button,
     /// tab change, unplugged headphones, lost tap) and only one of them is a
     /// finished take.
     @discardableResult
-    func stop(reason: StopReason = .interrupted) -> Summary? {
+    func stop(reason: StopReason = .interrupted, afterInterruption: Bool = false) -> Summary? {
         startRequested = false   // cancels a start still waiting on the permission prompt
-        soundCheckTask?.cancel()
-        soundCheckTask = nil
-        soundCheckSecondsLeft = 0
-        latencyCorrection = 0
-        measuredLatencyMs = nil
-        clickIsCancelled = false
-        analysisQueue.async { [weak self] in
-            self?.learner = nil
-            self?.canceller = nil
-        }
+        watchTask?.cancel()
+        watchTask = nil
+        settling = false
         guard isListening else { return nil }
-        // A take that never got past the sound check has nothing to report.
-        let summary = reason == .user && phase == .grading ? makeSummary() : nil
-        phase = .idle   // stops grading notes still in flight on the analysis queue
+        let summary = reason == .user ? makeSummary() : nil
+        isListening = false   // stops grading notes still in flight on the analysis queue
         inputLevel = 0
         inputSampleRate = 0
-        stopObservingVolume()
+        outputLatencyMs = nil
+        appliedOffsetMs = 0
+        routeKey = nil
+        calibrationSamples = []
+        calibrationCount = 0
+        recentRaw = []
         stopObservingInterruptions()
-        metronome?.onRenderDisrupted = nil
         metronome?.onInputTapLost = nil
         metronome?.onGridChanged = nil
         metronome?.detachInputTap()
         // Hand the session back: the metronome sets its own category again.
         metronome?.sessionOwnedExternally = false
-        restoreSession()
+        restoreSession(afterInterruption: afterInterruption)
         return summary
     }
 
@@ -312,8 +293,6 @@ final class TimingCoach {
         analysisQueue.async { [weak self] in
             guard let self else { return }
             self.detector = OnsetDetector()
-            self.learner = nil
-            self.canceller = nil
             // Carried over, these hand the new take the previous one's last
             // 50 ms: the meter flashes at a level nothing is producing.
             self.pendingPeak = 0
@@ -328,36 +307,17 @@ final class TimingCoach {
             // Without one the buffer has to go: `mach_absolute_time()` here is the
             // *delivery* time, a whole buffer period later (~21 ms at 48 kHz), and
             // would report every note as dragging by about the tolerance window.
-            guard time.isHostTimeValid else { return }
+            // Such a buffer still goes through the detector (its history stays
+            // continuous) and the level meter — it is live audio, and the stall
+            // watchdog must see it — only its onsets are dropped.
+            let hostTimeValid = time.isHostTimeValid
             let bufferHostTime = time.hostTime
-            // The input's own sample count, which is what the learned echo is
-            // aligned by. Host time is good enough to grade a note, but it jitters
-            // by fractions of a sample, and cancelling a 1.5 kHz tone needs better.
-            let sampleTime: Int64? = time.isSampleTimeValid ? time.sampleTime : nil
             self.analysisQueue.async {
-                self.learn(samples, sampleTime: sampleTime, hostTime: bufferHostTime,
-                           sampleRate: sampleRate)
-                var input = samples
-                var guardLevels: [Float]?
-                // Whether this buffer had the echo taken out. The canceller is
-                // installed on this queue a moment after the main actor has
-                // already switched to grading, so buffers in that gap — the one
-                // that completed the recording among them — still carry the
-                // click. Tagging each batch lets `register` drop exactly those.
-                let cancelled = self.canceller != nil
-                if let canceller = self.canceller {
-                    // Without a sample position the echo cannot be lined up, and
-                    // the raw signal still has the click in it. Skipping the
-                    // buffer costs a note at worst; grading it could cost the take.
-                    guard let sampleTime else { return }
-                    (input, guardLevels) = canceller.cancel(samples, at: sampleTime)
-                }
-                let onsets = self.detector.process(input, sampleRate: sampleRate,
-                                                   guardLevels: guardLevels)
+                let onsets = self.detector.process(samples, sampleRate: sampleRate)
                 self.pendingPeak = samples.reduce(self.pendingPeak) { max($0, abs($1)) }
-                let hostTimes = onsets.map { offset -> UInt64 in
+                let hostTimes = hostTimeValid ? onsets.map { offset -> UInt64 in
                     Self.hostTime(bufferHostTime, plus: Double(offset) / sampleRate - Self.inputLatency)
-                }
+                } : []
                 let now = AVAudioTime.seconds(forHostTime: mach_absolute_time())
                 let peak = self.pendingPeak
                 let publishLevel = now - self.lastLevelUpdate > 0.05
@@ -367,8 +327,11 @@ final class TimingCoach {
                 }
                 guard !hostTimes.isEmpty || publishLevel else { return }
                 Task { @MainActor in
-                    if publishLevel { self.updateLevel(peak) }
-                    for t in hostTimes { self.register(hostTime: t, cancelled: cancelled) }
+                    if publishLevel {
+                        self.lastAudioAt = Date()
+                        self.updateLevel(peak)
+                    }
+                    for t in hostTimes { self.register(hostTime: t) }
                 }
             }
         }
@@ -402,344 +365,104 @@ final class TimingCoach {
         metronome.onGridChanged = { [weak self] in
             guard let self, self.isListening else { return }
             self.stop()
-            // The route-change path says why; this one used to end the take with
-            // the readout simply vanishing and no sheet, which reads as a bug.
             // Tempo, time signature, sound and groove all rebuild the loop, and
             // all four are reachable mid-take, so the message names none of them.
             self.failure = "The click changed, so the grid did too and the take stopped. Start the check again."
         }
-        // Read the route only now. Engaging the input is itself a route-changing
-        // event — an A2DP route has no input side, so iOS renegotiates when the
-        // engine touches `inputNode` — and capturing it beforehand would have the
-        // observer kill the take the moment the new route settled.
-        checkedOutputs = Self.outputPorts()
-        observeVolume()
-        observeDisruptions(metronome)
-        // No separate "route still valid" flag guards `register`: the observer
-        // stops the take, `stop()` sets `phase = .idle`, and `register` already
-        // returns on that.
-        phase = .soundCheck
-        startSoundCheck(metronome)
-    }
-
-    /// Learn the click's echo while the player stays quiet: a second for the route
-    /// to settle, then `ClickLearner.bars` bars recorded. The countdown is only the
-    /// instruction; the recording finishes on the audio's clock, in `learn`, and
-    /// the verdict is `finishLearning`.
-    private func startSoundCheck(_ metronome: Metronome) {
-        // One bar in the microphone's samples. Equal to the loop when the two run
-        // at one rate — the only case where cancelling is allowed — and otherwise
-        // rounded, which is plenty to tell whether there is an echo at all.
-        let micRate = inputSampleRate
-        let period = Int((Double(metronome.loopFrames) * micRate / metronome.loopSampleRate).rounded())
-        guard period > 0, micRate > 0 else {
-            stop()
-            failure = "Lost track of the click. Start the metronome again."
-            return
-        }
-        let learnSeconds = Int((Double(period * ClickLearner.bars) / micRate).rounded(.up))
-        let total = Self.warmUpSeconds + learnSeconds
-        // The route may still be settling from activating the session and engaging
-        // the input; let it, right up to the moment recording starts.
-        routeSettlesAt = Date().addingTimeInterval(Double(Self.warmUpSeconds))
-        // Set before the task, or the first rendered frame shows a countdown of 0
-        // and then animates upwards under a label saying how long to stay quiet.
-        soundCheckSecondsLeft = total
-        soundCheckTask = Task { @MainActor [weak self] in
-            for remaining in stride(from: total, through: 1, by: -1) {
-                guard let self, self.phase == .soundCheck else { return }
-                self.soundCheckSecondsLeft = remaining
-                if remaining == learnSeconds {
-                    self.analysisQueue.async { [weak self] in
-                        self?.learner = ClickLearner(period: period)
-                    }
+        observeInterruptions()
+        isListening = true
+        // Judge the route only once it has settled — engaging the input is itself
+        // a route change, and reading it now would judge the route on its way.
+        settling = true
+        lastAudioAt = Date()
+        watchTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(Self.warmUpSeconds))
+            guard let self, !Task.isCancelled, self.isListening else { return }
+            self.settling = false
+            if Self.clickGoesToSpeaker() {
+                self.stop()
+                self.failure = Self.needsHeadphones
+                return
+            }
+            self.outputLatencyMs = (self.metronome?.outputLatency).map { $0 * 1000 }
+            // The route is final now: pick up its calibrated correction. A
+            // calibration run measures without one — it is what it measures.
+            self.routeKey = Self.currentRoute()?.key
+            self.appliedOffsetMs = self.mode == .take
+                ? (self.routeKey.flatMap { Self.storedOffsets()[$0] } ?? 0)
+                : 0
+            // The symptom, not a guess at its cause. A device joining the route
+            // can stop the engine — but so, at times, does engaging the input,
+            // and a Bluetooth headset renegotiates on its own schedule, so no
+            // notice says for sure that capture died. Audio no longer arriving
+            // does: then the button would stay green over nothing.
+            while !Task.isCancelled, self.isListening {
+                if Date().timeIntervalSince(self.lastAudioAt) > Self.stallSeconds {
+                    self.stop()
+                    self.failure = "The microphone stopped sending audio — start the check again."
+                    return
                 }
-                try? await Task.sleep(for: .seconds(1))
-                if Task.isCancelled { return }
+                try? await Task.sleep(for: .seconds(0.5))
             }
-            // A little past the countdown, in case the recording is running a
-            // buffer behind. Still learning after that means the audio stopped.
-            try? await Task.sleep(for: .seconds(2))
-            guard let self, !Task.isCancelled, self.phase == .soundCheck else { return }
-            self.stop()
-            self.failure = "Lost the audio while learning the click. Start the check again."
         }
     }
 
-    /// Feed the recording, on the analysis queue, and hand it over when complete.
-    nonisolated private func learn(_ samples: [Float], sampleTime: Int64?, hostTime: UInt64,
-                                   sampleRate: Double) {
-        guard var recording = learner else { return }
-        recording.consume(samples, sampleTime: sampleTime, hostTime: hostTime)
-        guard recording.isComplete else {
-            learner = recording
-            return
-        }
-        learner = nil
-        let learned = recording.finish(sampleRate: sampleRate)
-        Task { @MainActor [weak self] in self?.finishLearning(learned) }
-    }
+    // MARK: Route
 
-    private func finishLearning(_ learned: LearnedClick) {
-        guard phase == .soundCheck, let metronome else { return }
-        soundCheckTask?.cancel()
-        soundCheckTask = nil
-        soundCheckSecondsLeft = 0
-        if let why = verdict(learned, metronome) {
-            stop()
-            failure = why
-            return
-        }
-        phase = .grading
-    }
+    static let needsHeadphones =
+        "Put on headphones. Over the speaker the microphone hears the click itself and can't tell it from your playing."
 
-    /// Why the take cannot start, or nil once it is set up to.
-    ///
-    /// No leakage threshold anywhere in here, and that is the change. The old
-    /// check asked whether the click was quiet enough to ignore; this one does not
-    /// need it to be — it subtracts what it heard. What can still stop a take is a
-    /// recording that cannot be trusted, or an echo that cannot be lined up.
-    private func verdict(_ learned: LearnedClick, _ metronome: Metronome) -> String? {
-        guard !learned.broken else {
-            return "Lost the audio while learning the click. Start the check again."
-        }
-        guard learned.sawSignal else {
-            return "The microphone isn't picking anything up. Check that nothing is covering it and that no other app is using it."
-        }
-        guard learned.strayBursts == 0 else {
-            return "Heard something besides the click while it was listening. Stay completely still for the countdown, then play."
-        }
-        let latency = measureEcho(learned, metronome)
-        // Subtracting sample by sample needs the loop and the microphone on one
-        // clock at one rate. The phone's own speaker and wired headphones share the
-        // microphone's; a Bluetooth or AirPlay speaker runs its own and drifts away
-        // from it within seconds. This is a different question from "can it leak",
-        // which no port type answers.
-        if learned.period == metronome.loopFrames, Self.routeSharesOneClock() {
-            // Cancelled whenever it *can* be, whether or not an echo was found.
-            // Finding the echo is a test with a threshold, and a threshold can
-            // miss — a quiet click in a noisy room — while the subtraction does
-            // not care: if there is no echo it takes out the averaged room noise
-            // and costs a fifth more noise, and if there is one it takes it out.
-            // So the one way left for a leak to reach the grader is closed by not
-            // asking. The echo test only decides the latency, where an invented
-            // echo would do real harm.
-            let canceller = ClickCanceller(learned)
-            analysisQueue.async { [weak self] in self?.canceller = canceller }
-            clickIsCancelled = true
-            if let latency {
-                latencyCorrection = latency
-                measuredLatencyMs = latency * 1000
-            }
-            return nil
-        }
-        // Nothing to cancel with, so the take may only start if the click is not
-        // reaching the microphone at all — and that is judged over the *whole*
-        // bar, not the window around each beat that `measureEcho` searches. A
-        // Bluetooth speaker's echo arrives 150-300 ms late, outside that window;
-        // asking only there would find nothing and start grading the click.
-        guard !Self.echoAnywhere(learned) else {
-            #if os(iOS)
-            return "The click is coming back from a speaker that can't be kept in step with the microphone. Use the phone's own speaker, or headphones."
-            #else
-            return "The click is reaching the microphone and can't be removed on this setup. Use headphones."
-            #endif
-        }
-        // No echo anywhere: headphones on their own clock, or a speaker turned well
-        // down. Nothing to remove, and readings stay uncorrected.
-        return nil
-    }
-
-    /// Whether the click reaches the microphone anywhere in the bar, at whatever
-    /// delay. The same comparison as the per-beat test — the averaged bars' peak
-    /// against their difference's — over the whole loop. Measured: an echo is
-    /// found at 49, 180 and 300 ms of delay, faint or loud, and none is invented
-    /// in 240 silent recordings across four noise levels.
-    private static func echoAnywhere(_ learned: LearnedClick) -> Bool {
-        let peak = learned.envelope.max() ?? 0
-        let noisePeak = learned.noiseEnvelope.max() ?? 0
-        return peak >= max(noisePeak * echoOverNoise, echoMinimum)
-    }
-
-    /// Where each beat's echo starts, relative to the beat as heard — the latency
-    /// the system's own figures leave out. Nil if there is no echo to measure.
-    ///
-    /// The recording is indexed by the microphone's sample count, the beats by the
-    /// loop's; one buffer's host time ties the two together. That tie jitters by a
-    /// fraction of a millisecond, which is fine here — this only has to find where
-    /// an echo starts, not cancel it.
-    private func measureEcho(_ learned: LearnedClick, _ metronome: Metronome) -> Double? {
-        let period = learned.period
-        let rate = learned.sampleRate
-        let beats = metronome.activeBeatsPerMeasure
-        guard beats > 0,
-              let anchorFrame = metronome.loopFrame(
-                  atHostTime: Self.hostTime(learned.anchorHost, plus: -Self.inputLatency))
-        else { return nil }
-        let micPerLoopFrame = rate / metronome.loopSampleRate
-        let anchorIndex = Self.wrap(Int(learned.anchorSample % Int64(period)), period)
-
-        let before = Int(Self.echoSearchBefore * rate)
-        // Bounded by the beat as well as by time: at 1/1 and 240 bpm a bar is
-        // 250 ms, and a fixed 170 ms window would reach round the loop into the
-        // previous beat's ringing.
-        let beatSpacing = Double(metronome.beatFrames) * micPerLoopFrame
-        let after = min(Int(Self.echoSearchAfter * rate), Int(0.6 * beatSpacing) - before)
-        guard after > 0 else { return nil }
-        let window = before + after
-        var offsets: [Double] = []
-        for beat in 0..<beats {
-            let frame = Double(beat * metronome.beatFrames)
-            let beatIndex = anchorIndex + Int(((frame - anchorFrame) * micPerLoopFrame).rounded())
-            let start = Self.wrap(beatIndex - before, period)
-            var peak: Float = 0
-            var noisePeak: Float = 0
-            for k in 0..<window {
-                let p = (start + k) % period
-                peak = max(peak, learned.envelope[p])
-                noisePeak = max(noisePeak, learned.noiseEnvelope[p])
-            }
-            // The echo's start is where it first passes 30% of its peak — not where
-            // the onset detector would fire on it. Both were tried. The detector
-            // fires about half a millisecond later on the click's softer attack
-            // than on a plucked string, so measuring the latency with it leaves a
-            // −0.6 ms bias on every graded note; the 30% point leaves none.
-            guard peak >= max(noisePeak * Self.echoOverNoise, Self.echoMinimum),
-                  let rise = (0..<window).first(where: {
-                      learned.envelope[(start + $0) % period] > 0.3 * peak
-                  })
-            else { continue }
-            // The rise has to be a rise: quiet for a few milliseconds before it.
-            // Otherwise the window opened inside something already ringing —
-            // in a fast 16th-note groove, the previous step's echo, which arrives
-            // a whole latency after that step and can still be sounding at the
-            // window's start. Every beat then "rises" at sample 0, the offsets
-            // agree perfectly, and a wrong latency comes off every note. Such a
-            // beat is skipped; if too few are left, the latency is not measured
-            // at all, which leaves readings uncorrected rather than wrong.
-            let quiet = Int(Self.echoQuietBefore * rate)
-            guard rise >= quiet,
-                  (rise - quiet..<rise).allSatisfy({
-                      learned.envelope[(start + $0) % period] < Self.echoQuietLevel * peak
-                  })
-            else { continue }
-            offsets.append(Double(rise - before) / rate)
-        }
-        // Grooves rest on some beats; the click never does. Half the beats is
-        // enough, as long as they agree.
-        guard offsets.count >= max(1, (beats + 1) / 2) else { return nil }
-        let median = offsets.sorted()[offsets.count / 2]
-        guard offsets.allSatisfy({ abs($0 - median) < Self.echoConsistency }) else { return nil }
-        return median
-    }
-
-    /// Whether the output and the microphone run off the device's own clock.
-    private static func routeSharesOneClock() -> Bool {
+    /// Whether the click is playing out loud, where the microphone hears it.
+    /// Any other output — wired, Bluetooth, USB — counts as headphones; a
+    /// Bluetooth speaker cannot be told from a Bluetooth headset by port type,
+    /// and USB is as often a USB-C headphone adapter as a speaker. Those
+    /// speakers are caught once notes arrive, by `hearsClick`.
+    private static func clickGoesToSpeaker() -> Bool {
         #if os(iOS)
-        let route = AVAudioSession.sharedInstance().currentRoute
-        let ownOutputs: Set<AVAudioSession.Port> = [.builtInSpeaker, .builtInReceiver, .headphones]
-        let ownInputs: Set<AVAudioSession.Port> = [.builtInMic, .headsetMic]
-        return !route.outputs.isEmpty
-            && route.outputs.allSatisfy { ownOutputs.contains($0.portType) }
-            && route.inputs.allSatisfy { ownInputs.contains($0.portType) }
+        let speakers: Set<AVAudioSession.Port> = [.builtInSpeaker, .builtInReceiver, .airPlay,
+                                                   .HDMI, .carAudio, .lineOut]
+        return AVAudioSession.sharedInstance().currentRoute.outputs.contains { speakers.contains($0.portType) }
         #else
-        // No route information to go on. Without it the clocks cannot be vouched
-        // for, and a template sliding against a drifting echo adds an inverted
-        // click beside the real one — so no cancelling here.
+        // Unreachable in practice: the Mac app is Catalyst, where `os(iOS)` holds
+        // and the session reports the Mac's own speakers as `.builtInSpeaker`.
         return false
         #endif
     }
 
-    nonisolated private static func wrap(_ index: Int, _ period: Int) -> Int {
-        ((index % period) + period) % period
-    }
-
-    /// Tracks the output route: it decides whether measuring is possible at all,
-    /// and headphones pulled mid-session take the tap and the click's connections
-    /// with them without anything else reporting it.
-    ///
-    /// Watching the *route* rather than the engine's configuration is deliberate:
-    /// engaging the microphone reconfigures the engine ourselves, so an
-    /// engine-level observer tears down the setup it has just seen created.
+    /// Headphones pulled mid-take, or the sound moved to a speaker (AirPlay,
+    /// Control Center): either way the microphone would start hearing the click.
     private func observeRouteChanges() {
         #if os(iOS)
         stopObservingRouteChanges()
         routeObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main
         ) { [weak self] note in
-            guard let self, self.isListening else { return }
+            self?.refreshCalibration()
+            // Changes while settling are the input being engaged; `watchTask`
+            // task judges the route that results.
+            guard let self, self.isListening, !self.settling else { return }
+            // Only where the sound *went* matters. A device dropping out is not
+            // enough on its own: a Bluetooth headset renegotiating reports that
+            // too, while still on the player's head. Pulled headphones send the
+            // click to the speaker, so they are caught here all the same.
+            guard Self.clickGoesToSpeaker() else { return }
             let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
             let deviceGone = raw.flatMap(AVAudioSession.RouteChangeReason.init(rawValue:)) == .oldDeviceUnavailable
-            // Any change of output port invalidates the take: the sound check
-            // was run for the route it started on and says nothing about this one.
-            // Compared as a port set: a port type alone cannot tell a Bluetooth
-            // headset from a Bluetooth speaker.
-            let ports = Self.outputPorts()
-            guard deviceGone || ports != self.checkedOutputs else { return }
-            // Settling, not a switch. `deviceGone` is deliberately not excluded:
-            // the A2DP renegotiation this window exists for drops the old output
-            // port, so iOS reports it as exactly that, and excluding it skipped
-            // the grace in the one case it was added for. Nothing has been
-            // counted yet — the window closes when the tally starts — so re-pinning
-            // is sound and the verdict is reached entirely on the settled route.
-            if Date() < self.routeSettlesAt {
-                self.checkedOutputs = ports
-                self.checkedVolume = Self.currentVolume()
-                return
-            }
             self.stop()
-            self.failure = "The audio output changed — start the check again."
+            self.failure = deviceGone
+                ? "The headphones were disconnected — put them back on and start the check again."
+                : "The sound moved to a speaker — switch back to headphones and start the check again."
         }
         #endif
     }
 
-    /// Watch the output volume for the life of the take — see `volumeTolerance`.
-    private func observeVolume() {
-        #if os(iOS)
-        let session = AVAudioSession.sharedInstance()
-        checkedVolume = session.outputVolume
-        volumeObserver = session.observe(\.outputVolume, options: [.new]) { [weak self] _, change in
-            guard let volume = change.newValue else { return }
-            Task { @MainActor [weak self] in
-                guard let self, self.isListening else { return }
-                // While the echo is being learned, or subtracted, any change spoils
-                // it. Otherwise nothing is fixed to the old level, and only turning
-                // it *up* matters — that can push a click the microphone could not
-                // hear into one it can. Headphones, nudged quieter, keep going.
-                let learnedEcho = self.phase == .soundCheck || self.clickIsCancelled
-                let change = volume - self.checkedVolume
-                if learnedEcho, abs(change) > Self.volumeTolerance {
-                    self.stop()
-                    self.failure = "The volume changed, so the click has to be learned again. Start the check again."
-                } else if !learnedEcho, change > Self.volumeTolerance {
-                    self.stop()
-                    self.failure = "The volume went up, so the click may reach the microphone now. Start the check again."
-                }
-            }
-        }
-        #endif
+    private func stopObservingRouteChanges() {
+        if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
+        routeObserver = nil
     }
 
-    private func stopObservingVolume() {
-        volumeObserver?.invalidate()
-        volumeObserver = nil
-    }
-
-    /// Anything that can shift the loop against the microphone's sample clock
-    /// ends the take: a phone call or Siri taking the audio, or the engine
-    /// reconfiguring itself. The learned echo is lined up by sample count, so
-    /// after such a jump it is subtracted in the wrong place — the real click
-    /// stays in, and an inverted copy is added beside it.
-    ///
-    /// The engine's own notice is ignored until the warm-up is over: engaging the
-    /// microphone reconfigures it on purpose, and reacting to that is exactly the
-    /// self-inflicted teardown this file learned to avoid once already.
-    private func observeDisruptions(_ metronome: Metronome) {
-        metronome.onRenderDisrupted = { [weak self] in
-            guard let self, self.isListening, Date() >= self.routeSettlesAt else { return }
-            self.stop()
-            self.failure = "The audio was interrupted, so the click has to be learned again. Start the check again."
-        }
+    /// A phone call or Siri taking the audio ends the take.
+    private func observeInterruptions() {
         #if os(iOS)
         stopObservingInterruptions()
         interruptionObserver = NotificationCenter.default.addObserver(
@@ -748,8 +471,8 @@ final class TimingCoach {
             guard let self, self.isListening,
                   let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                   AVAudioSession.InterruptionType(rawValue: raw) == .began else { return }
-            self.stop()
-            self.failure = "The audio was interrupted, so the click has to be learned again. Start the check again."
+            self.stop(afterInterruption: true)
+            self.failure = "The audio was interrupted — start the check again."
         }
         #endif
     }
@@ -759,27 +482,7 @@ final class TimingCoach {
         interruptionObserver = nil
     }
 
-    private static func currentVolume() -> Float {
-        #if os(iOS)
-        AVAudioSession.sharedInstance().outputVolume
-        #else
-        0
-        #endif
-    }
-
-    /// The current output ports, by type. The sound check is pinned to this set.
-    private static func outputPorts() -> Set<String> {
-        #if os(iOS)
-        Set(AVAudioSession.sharedInstance().currentRoute.outputs.map(\.portType.rawValue))
-        #else
-        []
-        #endif
-    }
-
-    private func stopObservingRouteChanges() {
-        if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
-        routeObserver = nil
-    }
+    // MARK: Grading
 
     /// Peak level with a slow fall, so the meter doesn't flicker between buffers.
     private func updateLevel(_ peak: Float) {
@@ -787,20 +490,28 @@ final class TimingCoach {
     }
 
     /// Grade one detected note against the metronome grid.
-    private func register(hostTime: UInt64, cancelled: Bool) {
+    private func register(hostTime: UInt64) {
         // Onsets reach this hop by hop (analysis queue → main actor), so a note
         // detected just before the stop arrives after it. Grading it would leave
         // the take one or two notes past the summary the user is already reading.
-        // Only while grading. Not while the echo is being learned: onsets then are
-        // not evidence of anything — the recording speaks for itself, in `verdict`.
-        guard phase == .grading else { return }
-        // Once the echo is being cancelled, an onset from a buffer that was not is
-        // the click itself, landing near 0 ms and scoring as a perfect note.
-        guard cancelled || !clickIsCancelled else { return }
+        guard isListening, !settling else { return }
         detectedNotes += 1
-        guard let deviation = metronome?.deviation(atHostTime: hostTime,
-                                                   latency: latencyCorrection) else { return }
-        let hit = Hit(index: gradedNotes, deviationMs: deviation * 1000)
+        guard let deviation = metronome?.deviation(atHostTime: hostTime) else { return }
+        if hearsClick(deviation * 1000) {
+            stop()
+            failure = Self.hearsClickMessage
+            return
+        }
+        if mode == .calibration {
+            calibrationSamples.append(deviation * 1000)
+            calibrationCount = calibrationSamples.count
+            if calibrationSamples.count >= Self.calibrationLeadIn + Self.calibrationNotes {
+                finishCalibration()
+            }
+            return
+        }
+        // Take off the latency the system doesn't report (calibrated per route).
+        let hit = Hit(index: gradedNotes, deviationMs: deviation * 1000 - appliedOffsetMs)
         hits.append(hit)
         if hits.count > Self.historyLimit { hits.removeFirst(hits.count - Self.historyLimit) }
 
@@ -822,7 +533,97 @@ final class TimingCoach {
         let variance = max(0, takeSumOfSquares / Double(gradedNotes) - mean * mean)
         return Summary(notes: gradedNotes, onTime: takeOnTime, averageMs: mean,
                        spreadMs: variance.squareRoot(), earliestMs: takeMin,
-                       latestMs: takeMax, tape: hits, clickRemoved: clickIsCancelled)
+                       latestMs: takeMax, tape: hits)
+    }
+
+    static let hearsClickMessage =
+        "The microphone is hearing the click itself (a speaker?). Use headphones and start again."
+
+    /// The port type can't tell a Bluetooth or USB speaker from headphones, so
+    /// the click reaching the microphone is caught by what it does instead:
+    /// it lands at one fixed delay on every beat. A player spreads by 10 ms or
+    /// more; the echo, by about a millisecond.
+    private func hearsClick(_ rawMs: Double) -> Bool {
+        recentRaw.append(rawMs)
+        if recentRaw.count > Self.echoWindow { recentRaw.removeFirst(recentRaw.count - Self.echoWindow) }
+        guard recentRaw.count >= Self.echoHits else { return false }
+        let sorted = recentRaw.sorted()
+        var lo = 0
+        for hi in sorted.indices {
+            while sorted[hi] - sorted[lo] > Self.echoSpreadMs { lo += 1 }
+            if hi - lo + 1 >= Self.echoHits { return true }
+        }
+        return false
+    }
+
+    // MARK: Calibration
+
+    /// Median of the collected notes = the route's hidden latency (plus the
+    /// player's own habit, which is why they are asked to play dead on the click).
+    private func finishCalibration() {
+        let samples = Array(calibrationSamples.dropFirst(Self.calibrationLeadIn))
+        let key = routeKey
+        let name = Self.currentRoute()?.name ?? "these headphones"
+        stop()
+        guard let key, samples.count >= Self.calibrationNotes else {
+            failure = "Couldn't identify the headphones — try the calibration again."
+            return
+        }
+        let offset = Self.median(samples)
+        let scatter = Self.median(samples.map { abs($0 - offset) })
+        guard scatter <= Self.calibrationMaxScatterMs else {
+            failure = "The notes were too uneven to measure the delay. Try again, playing short, sharp notes exactly on the click."
+            return
+        }
+        guard abs(offset) <= Self.calibrationMaxOffsetMs else {
+            failure = "The delay came out implausibly large. Try again at a slower tempo."
+            return
+        }
+        var offsets = Self.storedOffsets()
+        offsets[key] = offset
+        UserDefaults.standard.set(offsets, forKey: Self.calibrationStoreKey)
+        refreshCalibration()
+        let value = Int(offset.rounded())
+        calibrationMessage = "Calibrated \(name): \(value > 0 ? "+" : "")\(value) ms will be taken off every note."
+    }
+
+    /// Forget the correction for the headphones currently connected.
+    func resetCalibration() {
+        guard let key = Self.currentRoute()?.key else { return }
+        var offsets = Self.storedOffsets()
+        offsets[key] = nil
+        UserDefaults.standard.set(offsets, forKey: Self.calibrationStoreKey)
+        calibrationMessage = nil
+        refreshCalibration()
+    }
+
+    private func refreshCalibration() {
+        let route = Self.currentRoute()
+        let offset = route.flatMap { Self.storedOffsets()[$0.key] }
+        let updated = route.flatMap { r in offset.map { Calibration(routeName: r.name, offsetMs: $0) } }
+        if updated != currentCalibration { currentCalibration = updated }
+    }
+
+    private static func storedOffsets() -> [String: Double] {
+        UserDefaults.standard.dictionary(forKey: calibrationStoreKey) as? [String: Double] ?? [:]
+    }
+
+    /// The output the click goes to, identified per device (a Bluetooth
+    /// headset's UID is its own), so each pair of headphones keeps its offset.
+    private static func currentRoute() -> (key: String, name: String)? {
+        #if os(iOS)
+        guard let out = AVAudioSession.sharedInstance().currentRoute.outputs.first else { return nil }
+        return ("\(out.portType.rawValue)|\(out.uid)", out.portName)
+        #else
+        return nil
+        #endif
+    }
+
+    private static func median(_ values: [Double]) -> Double {
+        let sorted = values.sorted()
+        guard !sorted.isEmpty else { return 0 }
+        let mid = sorted.count / 2
+        return sorted.count.isMultiple(of: 2) ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
     }
 
     private func resetTake() {
@@ -843,19 +644,17 @@ final class TimingCoach {
         // Mode is `.default`, not `.measurement`: measurement mode gives the
         // cleanest transients for detection but drops output level so far that
         // the click all but disappears — and a metronome you can't hear is not a
-        // metronome. `.defaultToSpeaker` keeps playback off the earpiece, which
-        // is where plain `.playAndRecord` would put it.
+        // metronome. `.defaultToSpeaker` keeps playback off the earpiece when no
+        // headphones are in, so the refusal is about the speaker, not silence.
         try? session.setCategory(.playAndRecord, mode: .default,
                                  options: [.defaultToSpeaker, .allowBluetoothA2DP])
         try? session.setActive(true)
         #endif
     }
 
-    private func restoreSession() {
-        #if os(iOS)
-        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
-        try? AVAudioSession.sharedInstance().setActive(true)
-        #endif
+    private func restoreSession(afterInterruption: Bool = false) {
+        let sounding = (metronome?.isRunning ?? false) || StemMixerEngine.shared.isPlaying
+        AudioSessionHandoff.restorePlayback(keepActive: sounding, afterInterruption: afterInterruption)
         metronome?.restartIfRunning()
     }
 
@@ -896,10 +695,6 @@ final class TimingCoach {
 /// up only over seconds, so it settles on the quiet between notes rather than
 /// on the notes; a floor that tracked the playing itself was what used to bury
 /// soft notes and fast tremolo under the level of the music around them.
-///
-/// The metronome is not filtered here — it is subtracted before this sees the
-/// signal (`ClickCanceller`). What remains is an optional per-sample floor, the
-/// guard against whatever the subtraction leaves behind.
 nonisolated struct OnsetDetector {
 
     private var sampleRate: Double
@@ -920,10 +715,9 @@ nonisolated struct OnsetDetector {
     /// …and this many times the room, so the room cannot trigger itself.
     private static let roomFactor: Float = 6
     /// Absolute floor — below this it is silence, whatever the ratios say.
-    static let silenceFloor: Float = 0.004
-    /// The smoothing that defines "now". Shared with `ClickCanceller`, whose guard
-    /// has to be on exactly this scale.
-    static let shortSeconds = 0.001
+    private static let silenceFloor: Float = 0.004
+    /// The smoothing that defines "now".
+    private static let shortSeconds = 0.001
 
     init(sampleRate: Double = 44_100) {
         self.sampleRate = sampleRate
@@ -934,18 +728,14 @@ nonisolated struct OnsetDetector {
         refractory = Int(0.08 * sampleRate)   // 80 ms — no double-triggering on one attack
     }
 
-    static func coefficient(_ seconds: Double, _ sampleRate: Double) -> Float {
+    private static func coefficient(_ seconds: Double, _ sampleRate: Double) -> Float {
         Float(1 - exp(-1 / (seconds * sampleRate)))
     }
 
     /// Offsets, in samples from the start of this buffer, of the onsets found.
     /// The hardware rate is only known once buffers start arriving, so the
     /// detector re-tunes itself the first time it sees a different one.
-    ///
-    /// `guardLevels`, when given, is a per-sample floor one-for-one with `samples`,
-    /// on the scale of the short-window energy.
-    mutating func process(_ samples: [Float], sampleRate: Double,
-                          guardLevels: [Float]? = nil) -> [Int] {
+    mutating func process(_ samples: [Float], sampleRate: Double) -> [Int] {
         if sampleRate != self.sampleRate { self = OnsetDetector(sampleRate: sampleRate) }
         var onsets: [Int] = []
         for (i, sample) in samples.enumerated() {
@@ -955,8 +745,7 @@ nonisolated struct OnsetDetector {
             short += (magnitude - short) * shortCoef
 
             if sinceOnset < Int.max { sinceOnset += 1 }
-            let floor = max(Self.silenceFloor, guardLevels?[i] ?? 0)
-            let threshold = max(long * Self.riseFactor, room * Self.roomFactor, floor)
+            let threshold = max(long * Self.riseFactor, room * Self.roomFactor, Self.silenceFloor)
             if short > threshold, sinceOnset > refractory {
                 onsets.append(i)
                 sinceOnset = 0
@@ -966,190 +755,5 @@ nonisolated struct OnsetDetector {
             room += (short - room) * (short < room ? roomDownCoef : roomUpCoef)
         }
         return onsets
-    }
-}
-
-// MARK: - Learning the click's echo
-
-/// Records the microphone over two whole bars while the player is quiet.
-///
-/// Everything rests on one fact: the metronome plays a loop, so every bar is
-/// bit-identical, and so is everything the room adds to it. Recorded in the
-/// microphone's own sample clock and averaged position by position, the two bars
-/// give the exact echo; their difference gives everything that was *not* the loop.
-/// Recorded any other way they give mush — hence the strict contiguity check: a
-/// dropped buffer shifts every later sample against the loop.
-nonisolated struct ClickLearner {
-    /// Two is the least that works: their average is the echo, and their
-    /// difference is everything that was not the loop, which is how a spoiled
-    /// recording is caught instead of being subtracted from every bar of the take.
-    /// More bars would average the room down further, at a cost in seconds of
-    /// silence the player has to keep.
-    static let bars = 2
-    let period: Int
-    private var raw: [Float]
-    private var filled = 0
-    private var expectedSample: Int64?
-    private var startSample: Int64 = 0
-    private var anchor: (host: UInt64, sample: Int64)?
-    private var sawSignal = false
-    private var broken = false
-
-    var isComplete: Bool { broken || filled == raw.count }
-
-    init(period: Int) {
-        self.period = period
-        raw = [Float](repeating: 0, count: period * Self.bars)
-    }
-
-    mutating func consume(_ samples: [Float], sampleTime: Int64?, hostTime: UInt64) {
-        guard !isComplete else { return }
-        guard let sampleTime, expectedSample == nil || sampleTime == expectedSample else {
-            broken = true
-            return
-        }
-        if expectedSample == nil {
-            startSample = sampleTime
-            anchor = (hostTime, sampleTime)
-        }
-        expectedSample = sampleTime + Int64(samples.count)
-        let count = min(samples.count, raw.count - filled)
-        for i in 0..<count {
-            raw[filled + i] = samples[i]
-            // Any real microphone has a noise floor; only a dead one is
-            // bit-exact silent. Not a loudness test, which would refuse the best
-            // setup there is — a working microphone in a quiet room.
-            if samples[i] != 0 { sawSignal = true }
-        }
-        filled += count
-    }
-
-    func finish(sampleRate: Double) -> LearnedClick {
-        guard !broken, let anchor else {
-            return LearnedClick(template: [], envelope: [], noiseEnvelope: [], period: period,
-                                sampleRate: sampleRate, anchorHost: 0, anchorSample: 0,
-                                strayBursts: 0, sawSignal: sawSignal, broken: true)
-        }
-        // Average and half-difference of the two bars, indexed by the microphone's
-        // sample count modulo the bar — which is how `ClickCanceller` looks it up.
-        let base = Int(((startSample % Int64(period)) + Int64(period)) % Int64(period))
-        var template = [Float](repeating: 0, count: period)
-        var halfDifference = [Float](repeating: 0, count: period)
-        for j in 0..<period {
-            let p = (base + j) % period
-            template[p] = (raw[j] + raw[j + period]) * 0.5
-            halfDifference[p] = (raw[j] - raw[j + period]) * 0.5
-        }
-
-        // Something that was not the loop — a cough, a creak, a touched string —
-        // stands out of the bars' difference as a burst far above its own typical
-        // level. Judged against the difference's median, not by the onset detector:
-        // that one adapts, and on a cold start it fires on peaks of plain room
-        // noise, which in this test meant refusing a silent room.
-        var difference = [Float](repeating: 0, count: period)
-        for j in 0..<period {
-            let d = raw[j] - raw[j + period]
-            let previous = j > 0 ? raw[j - 1] - raw[j - 1 + period] : 0
-            difference[j] = abs(d - 0.97 * previous)
-        }
-        let typical = stride(from: 0, to: period, by: 7).map { difference[$0] }.sorted()
-        let threshold = max(OnsetDetector.silenceFloor, 10 * typical[typical.count / 2])
-        let refractory = Int(0.08 * sampleRate)
-        var strayBursts = 0
-        var lastBurst = -refractory - 1
-        for j in 0..<period where difference[j] > threshold {
-            if j - lastBurst > refractory { strayBursts += 1 }
-            lastBurst = j
-        }
-
-        // Both as the detector would see them: pre-emphasised magnitude, read round
-        // the loop so the bar's first sample follows its last.
-        func emphasised(_ x: [Float]) -> [Float] {
-            (0..<period).map { abs(x[$0] - 0.97 * x[($0 + period - 1) % period]) }
-        }
-        return LearnedClick(template: template, envelope: emphasised(template),
-                            noiseEnvelope: emphasised(halfDifference), period: period,
-                            sampleRate: sampleRate, anchorHost: anchor.host,
-                            anchorSample: anchor.sample, strayBursts: strayBursts,
-                            sawSignal: sawSignal, broken: false)
-    }
-}
-
-/// What a recording produced. The arrays are indexed by the microphone's sample
-/// count modulo `period`.
-nonisolated struct LearnedClick {
-    let template: [Float]
-    /// The echo as the detector sees it.
-    let envelope: [Float]
-    /// The same for the bars' half-difference: the room noise left in the average.
-    let noiseEnvelope: [Float]
-    let period: Int
-    let sampleRate: Double
-    /// One buffer's host time and sample count: the tie between the recording's
-    /// clock and the loop's, used to find the beats in it.
-    let anchorHost: UInt64
-    let anchorSample: Int64
-    let strayBursts: Int
-    let sawSignal: Bool
-    let broken: Bool
-}
-
-/// Subtracts the learned echo from the live microphone signal.
-nonisolated struct ClickCanceller {
-    private let template: [Float]
-    private let guardLevels: [Float]
-    private let period: Int
-
-    /// What is left after subtracting is the echo's *change* since it was learned
-    /// — the volume nudged, the phone shifted on the table. So the detector also
-    /// gets a floor of this much of the echo's own energy wherever the echo is.
-    /// Measured with the volume 3 dB either way: no leftovers fire, and notes
-    /// landing exactly on the click are still found.
-    private static let guardFraction: Float = 0.5
-
-    init(_ learned: LearnedClick) {
-        template = learned.template
-        period = learned.period
-        let rate = learned.sampleRate
-        // On the detector's own scale: the echo's envelope smoothed exactly as
-        // "now" is, twice round the loop so it wraps across the bar line…
-        let smoothing = OnsetDetector.coefficient(OnsetDetector.shortSeconds, rate)
-        var energy = [Float](repeating: 0, count: period)
-        var level: Float = 0
-        for pass in 0..<2 {
-            for p in 0..<period {
-                level += (learned.envelope[p] - level) * smoothing
-                if pass == 1 { energy[p] = level }
-            }
-        }
-        // …then held for a millisecond or so each way, so the floor still covers
-        // the echo if it is a sample or two off.
-        let hold = Float(exp(-1 / (0.001 * rate)))
-        var levels = energy
-        for forward in [true, false] {
-            var held: Float = 0
-            for pass in 0..<2 {
-                for k in 0..<period {
-                    let p = forward ? k : period - 1 - k
-                    held = max(energy[p], held * hold)
-                    if pass == 1 { levels[p] = max(levels[p], held) }
-                }
-            }
-        }
-        guardLevels = levels.map { $0 * Self.guardFraction }
-    }
-
-    /// The buffer with the echo taken out, and the floor to go with it.
-    func cancel(_ samples: [Float], at sampleTime: Int64) -> ([Float], [Float]) {
-        var clean = samples
-        var floor = [Float](repeating: 0, count: samples.count)
-        var p = Int(((sampleTime % Int64(period)) + Int64(period)) % Int64(period))
-        for i in samples.indices {
-            clean[i] = samples[i] - template[p]
-            floor[i] = guardLevels[p]
-            p += 1
-            if p == period { p = 0 }
-        }
-        return (clean, floor)
     }
 }

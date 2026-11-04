@@ -9,9 +9,19 @@ import SwiftUI
 
 @main
 struct MazutApp: App {
+    /// Set once the user skips or finishes the intro; the intro never shows again.
+    @AppStorage("hasSeenIntro") private var hasSeenIntro = false
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            if hasSeenIntro {
+                ContentView()
+            } else {
+                OnboardingView {
+                    withAnimation(.easeInOut) { hasSeenIntro = true }
+                }
+                .transition(.opacity)
+            }
         }
     }
 }

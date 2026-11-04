@@ -149,13 +149,6 @@ final class Metronome {
     /// `reschedule()` rather than being re-derived per property at the call site:
     /// a take graded across two different grids reports one figure over both.
     var onGridChanged: (() -> Void)?
-    /// Called when the engine reconfigures itself — a route or format change
-    /// underneath it — which can shift the loop against the microphone. Only
-    /// reported; the metronome does not restart on it, because engaging the
-    /// microphone triggers the same notice, and restarting on that tore down the
-    /// setup it had just built.
-    var onRenderDisrupted: (() -> Void)?
-    private var configurationObserver: NSObjectProtocol?
     /// Kept so a rebuild can re-install the same tap instead of losing it.
     private var currentTap: (size: AVAudioFrameCount, block: AVAudioNodeTapBlock)?
     private var hasInputTap = false
@@ -170,12 +163,8 @@ final class Metronome {
     // Rebuilt on every start rather than reused: see `rebuildAndStart(tap:)`.
     private var engine = AVAudioEngine()
     private var player = AVAudioPlayerNode()
-    /// The rate the loop is rendered at. Set to the hardware output rate on every
-    /// rebuild, not fixed: the timing coach learns the click's echo sample by
-    /// sample in the microphone's own clock, which only works if one loop is a
-    /// whole number of hardware samples. A fixed 44.1 kHz loop resampled to a
-    /// 48 kHz device is not — at most tempos it lands between samples, drifting a
-    /// fraction further each bar.
+    /// The rate the loop is rendered at: the hardware output rate, set on every
+    /// rebuild, so the click is never resampled on its way out.
     private var sampleRate: Double = 44_100
     private var format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
     /// Measure length in frames (for computing the current beat).
@@ -206,10 +195,6 @@ final class Metronome {
         engine.stop()
         engine = AVAudioEngine()
         player = AVAudioPlayerNode()
-        if let configurationObserver { NotificationCenter.default.removeObserver(configurationObserver) }
-        configurationObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main
-        ) { [weak self] _ in self?.onRenderDisrupted?() }
 
         if let tap {
             let input = engine.inputNode
@@ -372,15 +357,8 @@ final class Metronome {
     /// The comparison happens on the timeline the player *hears*, so the click's
     /// output latency is taken out; the caller is expected to have already taken
     /// out the microphone's input latency.
-    ///
-    /// `latency` is whatever the round trip adds on top of what the system
-    /// reports — the timing coach measures it off the click's own echo. It comes
-    /// off *before* snapping to the nearest step, not after: at a fast 16th-note
-    /// grid a 50 ms error is most of half a step, and correcting after the snap
-    /// would move notes onto the wrong step altogether.
-    func deviation(atHostTime hostTime: UInt64, latency: Double = 0) -> Double? {
-        guard let raw = playbackPosition(atHostTime: hostTime) else { return nil }
-        let position = raw - latency
+    func deviation(atHostTime hostTime: UInt64) -> Double? {
+        guard let position = playbackPosition(atHostTime: hostTime) else { return nil }
         let step = Double(measureFrames) / sampleRate / Double(gridStepsPerMeasure)
         guard step > 0 else { return nil }
         // Distance to the nearest step, so the result lands in ±step/2.
@@ -390,9 +368,8 @@ final class Metronome {
     /// Where the loop had reached at `hostTime`, in seconds since the player
     /// started, with the click's output latency taken out.
     ///
-    /// The one place that conversion lives. It is the most load-bearing
-    /// expression in the timing feature — both what a note is graded against and
-    /// what the sound check looks for leakage in — and a second copy would drift.
+    /// Kept apart from `deviation` because it is the most load-bearing expression
+    /// in the timing feature: what every note is graded against.
     ///
     /// No host time on the render clock means there is nothing to measure
     /// against: "now" is not the render time, it is however long the onset spent
@@ -406,23 +383,9 @@ final class Metronome {
         return Double(playerTime.sampleTime) / sampleRate + elapsed - outputLatency
     }
 
-    /// One loop — a measure — in frames at `loopSampleRate`.
-    var loopFrames: Int { Int(measureFrames) }
-    /// The rate the loop is rendered at, which is the hardware output rate.
-    var loopSampleRate: Double { sampleRate }
-    /// One beat in frames. Exact: the measure buffer is a whole number of beats.
-    var beatFrames: Int { activeBeatsPerMeasure > 0 ? loopFrames / activeBeatsPerMeasure : 0 }
-
-    /// Where the loop was, in frames into the measure, at `hostTime` as heard.
-    /// `nil` while the metronome is stopped or not rendering.
-    func loopFrame(atHostTime hostTime: UInt64) -> Double? {
-        guard measureFrames > 0, let position = playbackPosition(atHostTime: hostTime) else { return nil }
-        let length = Double(measureFrames)
-        let frame = (position * sampleRate).truncatingRemainder(dividingBy: length)
-        return frame < 0 ? frame + length : frame
-    }
-
-    private var outputLatency: Double {
+    /// What the system reports for the click's way out — taken off every note
+    /// in `playbackPosition`, and shown by the timing coach as that same figure.
+    var outputLatency: Double {
         #if os(iOS)
         AVAudioSession.sharedInstance().outputLatency
         #else
@@ -498,14 +461,8 @@ final class Metronome {
 
     // MARK: - Voices
 
-    /// The click: a decaying sine, accented on the first beat.
-    ///
-    /// Back to the original shape. For a while it had a ramped attack and a
-    /// tapered tail, which existed only so a notch filter could remove it from
-    /// the microphone signal. The timing coach no longer filters the click out —
-    /// it learns the exact echo this produces in the room and subtracts it — and
-    /// that works for any waveform, so there was no reason left to change how the
-    /// metronome sounds.
+    /// The click: a decaying sine, accented on the first beat. The timing coach
+    /// needs headphones, so nothing here is shaped for the microphone's benefit.
     private func renderClick(_ out: UnsafeMutablePointer<Float>, total: Int, at start: Int,
                              accent: Bool) {
         let frames = min(total, Int(sampleRate * 0.03))
