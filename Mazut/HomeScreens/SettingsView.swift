@@ -11,6 +11,9 @@ import SwiftUI
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var showIntro = false
+    /// Hidden: five taps on the version row reveal the developer section.
+    @State private var versionTaps = 0
+    @AppStorage(TimingCoach.debugRecordingKey) private var timingDebugRecording = false
 
     private var versionText: String {
         let info = Bundle.main.infoDictionary
@@ -45,6 +48,18 @@ struct SettingsView: View {
 
                 Section("About") {
                     LabeledContent("Version", value: versionText)
+                        .contentShape(Rectangle())
+                        .onTapGesture { versionTaps += 1 }
+                }
+
+                if versionTaps >= 5 || timingDebugRecording {
+                    Section {
+                        Toggle("Record timing checks", isOn: $timingDebugRecording)
+                    } header: {
+                        Text("Developer")
+                    } footer: {
+                        Text("Saves the microphone of each timing check so it can be shared from the Metronome tab.")
+                    }
                 }
             }
             .navigationTitle("Settings")

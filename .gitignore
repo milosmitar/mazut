@@ -27,3 +27,6 @@ xcuserdata/
 # Mora doći POSLE *.mlpackage/ i *.bin pravila (poslednje poklapanje pobeđuje).
 !Mazut/HTDemucs6sCore.mlpackage/
 !Mazut/HTDemucs6sCore.mlpackage/**
+
+# xcode-build-server config za swift-lsp (sadrži lokalne putanje)
+buildServer.json

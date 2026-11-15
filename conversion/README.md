@@ -196,6 +196,31 @@ GPU ~720 ms | STFT ~14 ms | ISTFT ~96 ms | AAC upis ~77 ms.
 ISTFT-a (izbegava strided pristup GPU-backed izlazu), paralelni AAC upis 6 stemova,
 razdvojeni profiling tajmeri.
 
+### ✓ fp16 regresija na macOS 27: `reduce_mean` mora u fp32 (2026-11)
+
+Isti (bit-identičan) fp16 model koji je u junu merio spec 57 / time 54 dB, na macOS
+27.0.1 meri **spec 10.2 dB** / time 53.9 dB (`snr_check.py`, CPU_AND_GPU). Na pravoj
+pesmi „other" stem je bio na −35 dB, a vocals/guitar na 3–5 dB. Uzrok nije model:
+sveža konverzija daje isto, a fp32 graf je i dalje ispravan (spec 120 / time 114 dB).
+Novi Core ML runtime više ne drži fp16 redukcije dovoljno tačne, pa normalizacije
+(mean/std nad `mag`-om sa 2.75M elemenata i GroupNorm-ovi) ruše spektralnu granu.
+
+`fp16_bisect.py` konvertuje varijante sa pojedinim tipovima op-ova u fp32:
+
+| Varijanta (fp32 op-ovi) | spec | time | GPU ms (Mac) |
+|---|---|---|---|
+| sve fp16 | 10.2 | 53.9 | 51 |
+| **`reduce_mean` (152 op-a)** | **56.6** | **53.7** | 50 |
+| reduce + sqrt/real_div/layer_norm | 53–57 | 37–54 | 50 |
+
+**Ispravka:** `convert_mixed.py --full-fp16` sada ostavlja `reduce_mean` u fp32, bez
+gubitka brzine na Mac GPU-u. Brzinu na iPhone-u treba potvrditi
+(`[Mazut] profil/segment` log, Release). CPU_ONLY i dalje daje loš rezultat (10/13 dB),
+ali aplikacija ga ne koristi.
+
+`onnx_check.py` poredi ovaj model sa ONNX eksportima trećih strana (kandidati za
+Android). Promenljiva `MAZUT_COREML=<putanja>` bira Core ML model za poređenje.
+
 ### Preostalo / ideje za brzinu
 
 - Već GPU-bound na `.cpuAndGPU`; dalja brzina znači sam model (ANE je mrtav).

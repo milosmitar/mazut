@@ -136,6 +136,14 @@ final class Metronome {
     }
 
 
+    /// A tick a few milliseconds long instead of the 30 ms click. The timing
+    /// coach asks for it when the click goes to a speaker: the stretch of
+    /// microphone signal the click covers then is far narrower than the timing
+    /// tolerance, which is what lets `ClickCanceller` take it back out. Set
+    /// before the coach attaches its tap (the rebuild picks it up); it has no
+    /// `didSet`, so it cannot end a take by itself.
+    var shortClick = false
+
     /// Set by `TimingCoach` while it owns the audio session (`.playAndRecord`) —
     /// the metronome must not switch the category back to `.playback` under it.
     var sessionOwnedExternally = false
@@ -340,29 +348,33 @@ final class Metronome {
 
     // MARK: - Grid (for the timing coach)
 
-    /// The grid a played note is judged against. A groove uses its own step
-    /// resolution; everything else uses 8th notes, so playing between the clicks
-    /// isn't reported as being half a beat late.
-    var gridStepsPerMeasure: Int {
-        var subdivision = 2
-        if sound == .drums, let pattern = groove.pattern {
-            subdivision = max(pattern.stepsPerBeat, 2)
-        }
-        return activeBeatsPerMeasure * subdivision
+    /// Where a played note sits on the grid: how far from the nearest step, and
+    /// whether that step is a click (a beat) or one of the notes between clicks.
+    struct GridPosition {
+        /// Seconds from the nearest step, positive = late; within ±step/2.
+        let deviation: Double
+        /// The nearest step is a beat, not a subdivision between two clicks.
+        let isOnBeat: Bool
     }
 
-    /// How far a note played at `hostTime` sits from the nearest grid step, in
-    /// seconds (positive = late). `nil` while the metronome is stopped.
+    /// Where a note played at `hostTime` lands on a grid of `stepsPerBeat`
+    /// steps per beat (2 = 8ths, 3 = triplets, 4 = 16ths) — the subdivision the
+    /// player says they are playing, so notes between the clicks are measured
+    /// against where they belong instead of being reported as a fraction of a
+    /// beat early or late. `nil` while the metronome is stopped.
     ///
     /// The comparison happens on the timeline the player *hears*, so the click's
     /// output latency is taken out; the caller is expected to have already taken
     /// out the microphone's input latency.
-    func deviation(atHostTime hostTime: UInt64) -> Double? {
-        guard let position = playbackPosition(atHostTime: hostTime) else { return nil }
-        let step = Double(measureFrames) / sampleRate / Double(gridStepsPerMeasure)
+    func gridPosition(atHostTime hostTime: UInt64, stepsPerBeat: Int) -> GridPosition? {
+        guard let position = playbackPosition(atHostTime: hostTime),
+              activeBeatsPerMeasure > 0, stepsPerBeat > 0 else { return nil }
+        let step = measureSeconds / Double(activeBeatsPerMeasure * stepsPerBeat)
         guard step > 0 else { return nil }
-        // Distance to the nearest step, so the result lands in ±step/2.
-        return position - (position / step).rounded() * step
+        // Nearest step, so the deviation lands in ±step/2.
+        let index = (position / step).rounded()
+        let isOnBeat = Int(index) % stepsPerBeat == 0
+        return GridPosition(deviation: position - index * step, isOnBeat: isOnBeat)
     }
 
     /// Where the loop had reached at `hostTime`, in seconds since the player
@@ -374,7 +386,7 @@ final class Metronome {
     /// No host time on the render clock means there is nothing to measure
     /// against: "now" is not the render time, it is however long the onset spent
     /// hopping between queues, and would produce an invented number.
-    private func playbackPosition(atHostTime hostTime: UInt64) -> Double? {
+    func playbackPosition(atHostTime hostTime: UInt64) -> Double? {
         guard isRunning, measureFrames > 0,
               let nodeTime = player.lastRenderTime, nodeTime.isHostTimeValid,
               let playerTime = player.playerTime(forNodeTime: nodeTime) else { return nil }
@@ -382,6 +394,31 @@ final class Metronome {
             - AVAudioTime.seconds(forHostTime: nodeTime.hostTime)
         return Double(playerTime.sampleTime) / sampleRate + elapsed - outputLatency
     }
+
+    /// Where the clicks sit inside the looping measure, in output frames — what
+    /// the timing coach needs to take them back out of the microphone signal.
+    nonisolated struct TickLayout: Sendable {
+        let sampleRate: Double
+        /// Frames in one measure.
+        let period: Int
+        /// Frame at which each click starts.
+        let ticks: [Int]
+        /// Whether the first click is the accented (different) one.
+        let accentFirst: Bool
+    }
+
+    /// `nil` for the drum kit: its voices ring for most of a beat, so there is
+    /// no short stretch to mask.
+    var tickLayout: TickLayout? {
+        let beats = activeBeatsPerMeasure
+        guard sound == .click, measureFrames > 0, beats > 0 else { return nil }
+        let perBeat = Int(measureFrames) / beats
+        return TickLayout(sampleRate: sampleRate, period: Int(measureFrames),
+                          ticks: (0..<beats).map { $0 * perBeat }, accentFirst: beats > 1)
+    }
+
+    /// Length of the looping measure, in seconds (0 before the first start).
+    var measureSeconds: Double { Double(measureFrames) / sampleRate }
 
     /// What the system reports for the click's way out — taken off every note
     /// in `playbackPosition`, and shown by the timing coach as that same figure.
@@ -461,13 +498,15 @@ final class Metronome {
 
     // MARK: - Voices
 
-    /// The click: a decaying sine, accented on the first beat. The timing coach
-    /// needs headphones, so nothing here is shaped for the microphone's benefit.
+    /// The click: a decaying sine, accented on the first beat. `shortClick` is
+    /// the one concession to the microphone — see there.
     private func renderClick(_ out: UnsafeMutablePointer<Float>, total: Int, at start: Int,
                              accent: Bool) {
-        let frames = min(total, Int(sampleRate * 0.03))
-        let decay = sampleRate * 0.008
-        let freq = accent ? 1_500.0 : 1_000.0
+        // Short tick: higher (a phone speaker is loudest at 2–4 kHz, which
+        // makes up for the missing length) and 40 dB down in under 5 ms.
+        let frames = min(total, Int(sampleRate * (shortClick ? 0.006 : 0.03)))
+        let decay = sampleRate * (shortClick ? 0.001 : 0.008)
+        let freq = shortClick ? (accent ? 3_000.0 : 2_000.0) : (accent ? 1_500.0 : 1_000.0)
         let amp: Float = accent ? 0.9 : 0.55
         for n in 0..<frames {
             let t = Double(n) / sampleRate
@@ -551,7 +590,7 @@ final class Metronome {
         // from. Restart rather than sit there lying about it.
         //
         // Not while the coach is listening: a restart resets the player's sample
-        // time, which moves the very grid `deviation(atHostTime:)` measures
+        // time, which moves the very grid `gridPosition(atHostTime:stepsPerBeat:)` measures
         // against. The coach's own teardown covers failures during that window.
         if isRunning, !hasInputTap, !player.isPlaying,
            Date().timeIntervalSince(lastWatchdogRestart) > 0.5 {

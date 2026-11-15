@@ -67,8 +67,13 @@ def main():
 
     full_fp16 = "--full-fp16" in sys.argv
     if full_fp16:
-        precision = ct.precision.FLOAT16
-        mode = "full-fp16"
+        # reduce_mean stays fp32: since macOS/iOS 27 the GPU no longer keeps fp16 reductions
+        # accurate, and the normalizations (mag mean/std over 2.75M elements, GroupNorm)
+        # wreck the spectral branch (spec 10 dB instead of 57). No speed cost.
+        # See conversion/README.md and fp16_bisect.py.
+        precision = ct.transform.FP16ComputePrecision(
+            op_selector=lambda op: op.op_type != "reduce_mean")
+        mode = "full-fp16 (reduce_mean fp32)"
     else:
         precision = ct.transform.FP16ComputePrecision(op_selector=op_selector)
         mode = "mixed"

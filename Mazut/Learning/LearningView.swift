@@ -31,6 +31,19 @@ private func loadLocalImage(_ url: URL) -> Image? {
 #endif
 }
 
+/// Decoded list thumbnails. A thumbnail never changes once written (one per
+/// item id), so a hit is always valid; misses aren't cached, so a thumbnail
+/// that arrives from iCloud later still shows up on the next `revision` bump.
+private final class ThumbnailBox { let image: Image; init(_ image: Image) { self.image = image } }
+private let thumbnailCache = NSCache<NSURL, ThumbnailBox>()
+
+private func cachedThumbnail(_ url: URL) -> Image? {
+    if let hit = thumbnailCache.object(forKey: url as NSURL) { return hit.image }
+    guard let image = loadLocalImage(url) else { return nil }
+    thumbnailCache.setObject(ThumbnailBox(image), forKey: url as NSURL)
+    return image
+}
+
 private func kindLabel(_ kind: LearningItemKind) -> String {
     switch kind {
     case .video: return "Video"
@@ -77,15 +90,67 @@ private struct PickedVideo: Transferable {
 /// everywhere, including here.
 struct LearningTab: View {
     @State private var root: LearningFolder = LearningFolder(id: LearningStore.rootID, name: "Learning")
+    /// False until a load actually returns the library. Editing before that would
+    /// save a tree built on the empty placeholder and overwrite the real (iCloud) index.
+    @State private var isLoaded = false
+    /// The index exists in iCloud but isn't on this device yet.
+    @State private var isWaitingForICloud = false
+    @State private var sync = LearningSync()
 
     var body: some View {
         NavigationStack {
             ZStack {
                 TabBackgroundView()
-                LearningFolderView(path: [], root: $root)
+                if isLoaded {
+                    LearningFolderView(path: [], root: $root)
+                } else if isWaitingForICloud {
+                    ProgressView("Waiting for your library from iCloud…")
+                } else {
+                    ProgressView()
+                }
             }
         }
-        .onAppear { root = LearningStore.load() }
+        .environment(sync)
+        .task {
+            await LearningStore.prepare()
+            // Before the first load, so the arrival of a not-yet-downloaded
+            // index triggers a reload.
+            sync.start()
+            await reload()
+            // Fallback in case no metadata update arrives (e.g. still offline).
+            // Backing off: while offline every attempt finds the same nothing,
+            // and each one occupies the I/O queue saves go through.
+            var delay = 15.0
+            while !isLoaded && !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(delay))
+                await reload()
+                delay = min(delay * 2, 300)
+            }
+        }
+        // Another device changed the library. Thumbnails arriving bump only
+        // `revision`, which the rows read; they don't need the index re-read.
+        .onChange(of: sync.indexRevision) {
+            Task { await reload() }
+        }
+    }
+
+    private func reload() async {
+        let savesBefore = LearningStore.saveCount
+        let result = await LearningStore.load()
+        // A local edit was saved while this load ran, so the result may predate
+        // it. The in-memory tree is newer; that save's own iCloud update bumps
+        // `indexRevision` and loads again afterwards.
+        guard LearningStore.saveCount == savesBefore else { return }
+        switch result {
+        case .loaded(let fresh):
+            if fresh != root { root = fresh }
+            isLoaded = true
+            isWaitingForICloud = false
+        case .unavailable:
+            // Keep showing what we have (if already loaded), but never let the
+            // user edit a placeholder.
+            if !isLoaded { isWaitingForICloud = true }
+        }
     }
 }
 
@@ -95,6 +160,7 @@ private struct LearningFolderView: View {
     /// Subfolder IDs from the root down to, and including, this folder. Empty = the root itself.
     let path: [String]
     @Binding var root: LearningFolder
+    @Environment(LearningSync.self) private var sync
 
     @State private var showNewSubfolderAlert = false
     @State private var newSubfolderName = ""
@@ -363,7 +429,9 @@ private struct LearningFolderView: View {
                     }
                 }
             default:
-                if let img = loadLocalImage(LearningStore.thumbnailURL(for: clip)) {
+                // Reading `revision` re-renders this once an iCloud thumbnail arrives.
+                let _ = sync.revision
+                if let img = cachedThumbnail(LearningStore.thumbnailURL(for: clip)) {
                     img.resizable().aspectRatio(contentMode: .fill)
                 } else {
                     Image(systemName: kindSystemImage(clip.kind)).foregroundStyle(.secondary)
@@ -384,7 +452,10 @@ private struct LearningFolderView: View {
     }
 
     private func deleteSubfolders(_ offsets: IndexSet) {
-        for i in offsets { LearningStore.deleteAllMedia(in: subfolders[i]) }
+        for i in offsets {
+            LearningStore.deleteAllMedia(in: subfolders[i])
+            root.deletedIDs.formUnion(subfolders[i].allIDs)
+        }
         LearningStore.mutate(at: path, in: &root) { $0.subfolders.remove(atOffsets: offsets) }
         LearningStore.save(root)
     }
@@ -400,7 +471,13 @@ private struct LearningFolderView: View {
                     importError = "Couldn't load the video."
                     return
                 }
-                let clip = try LearningStore.importVideo(from: picked.url, title: "Video \(clips.count + 1)")
+                let title = "Video \(clips.count + 1)"
+                // Off the main thread: a coordinated copy of a large video into
+                // the iCloud container can block for a long time.
+                let source = picked.url
+                let clip = try await Task.detached {
+                    try LearningStore.importVideo(from: source, title: title)
+                }.value
                 try? FileManager.default.removeItem(at: picked.url)
                 append(clip)
             } catch {
@@ -419,7 +496,10 @@ private struct LearningFolderView: View {
                     return
                 }
                 let ext = item.supportedContentTypes.first?.preferredFilenameExtension ?? "jpg"
-                let clip = try LearningStore.importImage(data: data, ext: ext, title: "Photo \(clips.count + 1)")
+                let title = "Photo \(clips.count + 1)"
+                let clip = try await Task.detached {
+                    try LearningStore.importImage(data: data, ext: ext, title: title)
+                }.value
                 append(clip)
             } catch {
                 importError = error.localizedDescription
@@ -432,8 +512,10 @@ private struct LearningFolderView: View {
         Task {
             defer { isImporting = false }
             do {
-                let clip = try LearningStore.importDocument(
-                    from: url, title: url.deletingPathExtension().lastPathComponent)
+                let title = url.deletingPathExtension().lastPathComponent
+                let clip = try await Task.detached {
+                    try LearningStore.importDocument(from: url, title: title)
+                }.value
                 append(clip)
             } catch {
                 importError = error.localizedDescription
@@ -479,6 +561,7 @@ private struct LearningFolderView: View {
             f.clips.removeAll { c in removed.contains { $0.id == c.id } }
         }
         for clip in removed { LearningStore.deleteMedia(for: clip) }
+        root.deletedIDs.formUnion(removed.map(\.id))
         LearningStore.save(root)
     }
 
@@ -496,6 +579,8 @@ private struct ClipPreviewSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
     @State private var player: AVPlayer?
+    /// Local file of a video/photo/document item once it's fully on this device.
+    @State private var media: MediaState = .loading
     @State private var title: String
     @State private var showRenameAlert = false
     @State private var editedTitle = ""
@@ -529,27 +614,15 @@ private struct ClipPreviewSheet: View {
                         .buttonStyle(.bordered)
                         .padding(12)
                     }
-                case .video:
-                    if let player {
-                        VideoPlayer(player: player)
-                            .onAppear { player.play() }
-                    } else {
-                        ProgressView()
-                    }
-                case .image:
-                    if let url = LearningStore.mediaURL(for: clip), let img = loadLocalImage(url) {
-                        ScrollView([.horizontal, .vertical]) {
-                            img.resizable().scaledToFit()
-                        }
-                        .background(Color.black)
-                    } else {
-                        ContentUnavailableView("Couldn't load the photo", systemImage: "photo")
-                    }
-                case .document:
-                    if let url = LearningStore.mediaURL(for: clip) {
-                        DocumentPreview(url: url)
-                    } else {
-                        ContentUnavailableView("Couldn't load the document", systemImage: "doc")
+                default:
+                    switch media {
+                    case .loading:
+                        ProgressView(LearningStore.isUsingICloud ? "Downloading from iCloud…" : "Loading…")
+                    case .failed(let message):
+                        ContentUnavailableView("Couldn't load the file", systemImage: "icloud.slash",
+                                               description: Text(message))
+                    case .ready(let url):
+                        localMediaView(url)
                     }
                 }
             }
@@ -579,12 +652,53 @@ private struct ClipPreviewSheet: View {
                 }
             }
         }
-        .onAppear {
-            if case .video = clip.source, let url = LearningStore.mediaURL(for: clip) {
-                player = AVPlayer(url: url)
-            }
-        }
+        .task { await prepareMedia() }
         .onDisappear { player?.pause() }
+    }
+
+    @ViewBuilder
+    private func localMediaView(_ url: URL) -> some View {
+        switch clip.source {
+        case .video:
+            if let player {
+                VideoPlayer(player: player)
+                    .onAppear { player.play() }
+            }
+        case .image:
+            if let img = loadLocalImage(url) {
+                ScrollView([.horizontal, .vertical]) {
+                    img.resizable().scaledToFit()
+                }
+                .background(Color.black)
+            } else {
+                ContentUnavailableView("Couldn't load the photo", systemImage: "photo")
+            }
+        case .document:
+            DocumentPreview(url: url)
+        case .youtube:
+            EmptyView()
+        }
+    }
+
+    /// Videos/photos/documents synced from another device may still be
+    /// placeholders here — download them before handing the URL to a player.
+    private func prepareMedia() async {
+        guard let url = LearningStore.mediaURL(for: clip) else { return }   // YouTube
+        do {
+            try await LearningStore.ensureDownloaded(url)
+            if case .video = clip.source { player = AVPlayer(url: url) }
+            media = .ready(url)
+        } catch is CancellationError {
+            // Sheet closed while downloading.
+        } catch {
+            media = .failed(error.localizedDescription)
+        }
+    }
+
+    private enum MediaState {
+        case loading
+        case ready(URL)
+        case failed(String)
     }
 }
 

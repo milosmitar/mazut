@@ -70,10 +70,14 @@ order:   drums, bass, other, vocals, guitar, piano   (== DemucsSeparator.modelOr
    session interruptions, and the Live Activity lifecycle.
 5. `ContentView` — single SwiftUI view: library list, file importer, transport, stem mixer.
 6. `Mazut/Learning/` — the "Learning" tab: user-created folders of lesson clips, each a local
-   video (picked via `PhotosPicker`, copied into `<Application Support>/MazutLearning/Media/`)
+   video (picked via `PhotosPicker`, copied into the library's `Media/` folder)
    or a YouTube link (`ClipSource.youtube(videoID:)`). Folders/clips persist as JSON in
-   `LearningStore` (mirrors `PlaylistStore`). This is the **only feature in the app that touches
-   the network**: YouTube playback embeds the standard iframe player in a `WKWebView`
+   `LearningStore` (mirrors `PlaylistStore`) under `<Application Support>/MazutLearning/`.
+   `LearningStore` also has iCloud sync code (container `iCloud.com.tarmi.Mazut`), but it is
+   **inactive**: the app has no iCloud entitlement yet (needs a paid developer account), so
+   `url(forUbiquityContainerIdentifier:)` returns nil and the library stays local. Enabling it
+   means adding the iCloud capability (iCloud Documents + that container) in Signing &
+   Capabilities. This is the **only feature in the app that touches the network**: YouTube playback embeds the standard iframe player in a `WKWebView`
    (`YouTubePlayerView`) since there's no way to get a directly playable URL from a YouTube
    link without violating its terms; thumbnails/titles come from YouTube's public
    `img.youtube.com` and `oembed` endpoints. Local clips play via AVKit's `VideoPlayer`.
@@ -82,7 +86,25 @@ order:   drums, bass, other, vocals, guitar, piano   (== DemucsSeparator.modelOr
    so it runs in the app process). `StemActivityShared.swift` compiles into **both** targets
    (sync-group membership exception in the pbxproj).
 
+8. `Metronome` + `TimingCoach` (`Mazut/Audio/`) — the Metronome tab's "Check my timing":
+   the microphone tap lives on the metronome's own `AVAudioEngine`, onsets are graded against
+   the click grid. With headphones nothing needs removing. Over the **phone's own speaker**
+   the click becomes a 6 ms tick (`Metronome.shortClick`) and `ClickCanceller` (bottom of
+   `TimingCoach.swift`) takes it out: blank ~7.5 ms around the tick, subtract a learned
+   template for the next 80 ms. Other loud routes (AirPlay, HDMI, car, Mac) and the Drums
+   sound over a speaker are refused.
+
 ### Known traps (do not regress)
+- **Timing check over the speaker — what already failed, measured on a device** (details in
+  the `TimingCoach.swift` header and on `ClickCanceller`): notch filters on the click; a
+  one-off learned echo; **voice processing / system AEC** (removes the click by ducking the
+  microphone → ~50 ms dead zone centred on the beat; also reconfigures the engine on start);
+  connecting `inputNode` into the render graph while tapping it (a 23 ms block of zeros in
+  every 3–4); learning the tick template from windows with playing in them, or aging out the
+  template's quiet reference windows (both make the template *add* notes nobody played).
+  The canceller counts microphone samples against click frames, so it needs input rate ==
+  click render rate. A hidden switch (Settings › tap the version 5×) records takes as
+  WAV + notes for offline analysis.
 - **Core ML output strides**: `time_out` is channel-stride-padded (343984, not 343980) for
   ×16 alignment. `consume()` in `DemucsSeparator` reads outputs via `.strides`, never
   assuming contiguity. Ignoring strides silently breaks the time branch (~2 dB) while the
@@ -95,6 +117,11 @@ order:   drums, bass, other, vocals, guitar, piano   (== DemucsSeparator.modelOr
   and mixed precision — do not switch to `.all` to "speed it up." (fp16 *compute on GPU* is
   fine, ~54 dB; the old "fp16 destroys the time branch / fp32 is mandatory" note was from an
   older coremltools setup and no longer holds.)
+- **`reduce_mean` ops must stay fp32 in the fp16 model.** Since macOS/iOS 27, fully fp16
+  normalization reductions wreck the spectral branch (spec 10 dB instead of 57, while time
+  still looks fine at 54 dB). `convert_mixed.py --full-fp16` keeps them fp32 at no speed
+  cost. Always check **both** spec and time SNR with `snr_check.py` after any conversion or
+  OS update.
 - **`spec_out` is read strided in ISTFT** (`re[k*T+t]`, stride T). `consume()` copies it to a
   contiguous CPU buffer once (sequential memcpy) before ISTFT — keep that; it avoids strided
   access into GPU-backed Core ML output memory.

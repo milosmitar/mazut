@@ -67,6 +67,7 @@ struct ContentView: View {
     @State private var separator = DemucsSeparator()
     @State private var metronome = Metronome()
     @State private var timingCoach = TimingCoach()
+    @AppStorage(TimingCoach.debugRecordingKey) private var timingDebugRecording = false
     /// Non-nil while the take summary sheet is up.
     @State private var timingSummary: TimingCoach.Summary?
     @State private var tuner = Tuner()
@@ -515,13 +516,25 @@ struct ContentView: View {
         .scrollBounceBehavior(.basedOnSize)
         .animation(.easeInOut(duration: 0.2), value: metronome.sound)
         .animation(.easeInOut(duration: 0.2), value: timingCoach.isListening)
+        // Picking a groove picks what you'll play along with it: a triplet or
+        // 16th groove graded on 8ths would be half a step off on every note.
+        // Only on a change, so the picker stays the player's to override.
+        .onChange(of: metronome.groove) { matchSubdivisionToGroove() }
+        .onChange(of: metronome.sound) { matchSubdivisionToGroove() }
+    }
+
+    private func matchSubdivisionToGroove() {
+        guard metronome.sound == .drums, !timingCoach.isListening,
+              let steps = metronome.groove.pattern?.stepsPerBeat,
+              let subdivision = TimingCoach.Subdivision(rawValue: max(steps, 2)) else { return }
+        timingCoach.subdivision = subdivision
     }
 
     // MARK: - Timing check (microphone)
 
-    /// Grades what you play against the click grid. Headphones only: the coach
-    /// refuses a speaker route itself, so the UI gates on nothing beyond the
-    /// metronome actually running, and says up front what it needs.
+    /// Grades what you play against the click grid. The coach decides by itself
+    /// what the current route allows (headphones, the phone's speaker, or a
+    /// refusal), so the UI gates on nothing beyond the metronome actually running.
     private var timingSection: some View {
         VStack(spacing: 10) {
             Button {
@@ -556,7 +569,7 @@ struct ContentView: View {
             } else if timingCoach.isListening {
                 if timingCoach.mode == .calibration { calibrationReadout } else { timingReadout }
             } else {
-                Label("Put on headphones, then play along with the click — each note gets measured against it.",
+                Label("Play along with the click — each note gets measured against it. Headphones measure most precisely; over the phone's speaker, let four clicks pass first.",
                       systemImage: "headphones")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -564,8 +577,42 @@ struct ContentView: View {
             }
 
             if !timingCoach.isListening {
+                subdivisionRow
                 calibrationRow
+                debugRecordingRow
             }
+        }
+    }
+
+    /// What you play between the clicks, so those notes are measured where they
+    /// belong — and whether they count at all. Only between takes: the coach
+    /// reads it per note, and a take graded on two grids means nothing.
+    private var subdivisionRow: some View {
+        VStack(spacing: 6) {
+            Picker("Playing", selection: $timingCoach.subdivision) {
+                ForEach(TimingCoach.Subdivision.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            Toggle("Grade only notes on the click", isOn: $timingCoach.gradesBeatsOnly)
+                .font(.caption)
+            Text(timingCoach.gradesBeatsOnly
+                    ? "Notes between the clicks are heard but left out of the score."
+                    : "Notes between the clicks are measured against the \(timingCoach.subdivision.label.lowercased()) grid.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+    }
+
+    /// The last take's recording, while the hidden debug switch (Settings ›
+    /// tap the version five times) is on.
+    @ViewBuilder
+    private var debugRecordingRow: some View {
+        if timingDebugRecording, !timingCoach.lastRecording.isEmpty {
+            ShareLink(items: timingCoach.lastRecording) {
+                Label("Share last recording", systemImage: "square.and.arrow.up")
+            }
+            .font(.caption.bold())
         }
     }
 
@@ -635,7 +682,24 @@ struct ContentView: View {
             // readings" can be told apart from "no signal".
             inputMeter
 
-            if let hit = timingCoach.lastHit {
+            if let heard = timingCoach.clickLearningProgress {
+                // Speaker take: the coach is learning the click's sound and
+                // needs to hear it alone first.
+                VStack(spacing: 6) {
+                    Label("Don't play yet — listen to \(timingCoach.clickLearningNeeded) clicks",
+                          systemImage: "hand.raised.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.orange)
+                    HStack(spacing: 8) {
+                        ForEach(0..<timingCoach.clickLearningNeeded, id: \.self) { step in
+                            Circle()
+                                .fill(step < heard ? Color.orange : Color.secondary.opacity(0.3))
+                                .frame(width: 8, height: 8)
+                        }
+                    }
+                }
+                .animation(.easeOut(duration: 0.15), value: heard)
+            } else if let hit = timingCoach.lastHit {
                 Text(deviationText(hit.deviationMs))
                     .font(.title3.weight(.semibold).monospacedDigit())
                     .foregroundStyle(hit.isOnTime ? Color.green : Color.orange)
@@ -658,6 +722,14 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if timingCoach.clickOverloading {
+                Label("The click is overloading the microphone — turn the volume down a little.",
+                      systemImage: "speaker.wave.3.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .multilineTextAlignment(.center)
+            }
+
             // Which stage is alive — notes heard vs. notes actually measured.
             Text(timingStatusText)
                 .font(.caption2)
@@ -674,7 +746,8 @@ struct ContentView: View {
         let output = timingCoach.outputLatencyMs.map { " · output \(Int($0.rounded())) ms" } ?? ""
         let calibrated = timingCoach.appliedOffsetMs != 0
             ? " · calibrated \(Int(timingCoach.appliedOffsetMs.rounded())) ms" : ""
-        return "mic \(rate) · notes \(timingCoach.detectedNotes) · measured \(timingCoach.gradedNotes)\(output)\(calibrated)"
+        let speaker = timingCoach.clickMasking ? "speaker · " : ""
+        return "\(speaker)mic \(rate) · notes \(timingCoach.detectedNotes) · measured \(timingCoach.gradedNotes)\(output)\(calibrated)"
     }
 
     /// "+18 ms · late" — sign included, so early/late is readable at a glance.
