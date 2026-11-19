@@ -65,6 +65,15 @@ nonisolated enum StemCache {
         return dir
     }
 
+    /// Folder for the given key only if it already exists (never creates it) —
+    /// for side files that must not resurrect a deleted song.
+    static func existingDirectory(for key: String) -> URL? {
+        let dir = root.appendingPathComponent(key, isDirectory: true)
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir) && isDir.boolValue
+            ? dir : nil
+    }
+
     /// Map of stems if all 6 files are present, otherwise nil (cache miss).
     /// Looks for .m4a, falling back to .wav (for older caches).
     static func stems(for key: String) -> [StemKind: URL]? {

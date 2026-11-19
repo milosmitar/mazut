@@ -76,6 +76,24 @@ private let introPages: [IntroPage] = [
         ]
     ),
     IntroPage(
+        systemImage: "repeat",
+        tint: Color("mazut_red"),
+        title: "Practice Tools",
+        subtitle: "Drill the hard part of a song: loop it, slow it down, play along with the click.",
+        features: [
+            IntroFeature(systemImage: "waveform", title: "Song timeline",
+                         detail: "See the whole song as a waveform. Tap or drag to jump, pinch to zoom in."),
+            IntroFeature(systemImage: "arrow.triangle.2.circlepath", title: "A–B loop",
+                         detail: "Tap Set A, then Set B, and that part repeats without a gap. Use − / + to nudge either end."),
+            IntroFeature(systemImage: "tortoise", title: "Slow down",
+                         detail: "Play at 50–100% speed without changing the pitch."),
+            IntroFeature(systemImage: "metronome", title: "Song tempo",
+                         detail: "The metronome sets itself to the song's tempo and follows the speed. Tap the BPM to double or halve it."),
+            IntroFeature(systemImage: "bookmark", title: "Remembered per song",
+                         detail: "Speed and tempo are saved with each song for next time. The loop starts fresh every time."),
+        ]
+    ),
+    IntroPage(
         systemImage: "music.note.list",
         tint: .purple,
         title: "Playlists",

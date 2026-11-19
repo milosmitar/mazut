@@ -102,6 +102,27 @@ struct ContentView: View {
     @State private var repeatEnabled = false
     /// Random pick of the next song from the queue, instead of the next one in order.
     @State private var shuffleEnabled = false
+    /// Waveform of the current song for the timeline (nil while being built).
+    @State private var waveformLevels: [UInt8]?
+    @State private var waveformTask: Task<Void, Never>?
+    /// Short hint under the loop controls (e.g. why "Set B" was refused).
+    @State private var loopHint: String?
+    @State private var loopHintTask: Task<Void, Never>?
+    /// Bumped on a refused loop action — drives the warning haptic.
+    @State private var loopRejectCount = 0
+
+    // MARK: - Song tempo (metronome)
+
+    /// Tempo detected for the current song (nil = unknown / still detecting).
+    @State private var detectedBPM: Double?
+    /// Metronome tempo the user picked for the current song (overrides detection).
+    @State private var songBPM: Int?
+    @State private var tempoTask: Task<Void, Never>?
+    /// TempoDetector version that analysed the current song (see PracticeSettings).
+    @State private var tempoVersion: Int?
+    /// Metronome tab's BPM before a song was opened — restored on leaving the player,
+    /// so songs don't overwrite the plain metronome's tempo.
+    @State private var bpmBeforePlayer: Int?
 
     var body: some View {
         Group {
@@ -117,6 +138,11 @@ struct ContentView: View {
             engine.onPlaybackFinished = { playNext() }
             engine.onRemoteNext = { playNextManual() }
             engine.onRemotePrevious = { playPrevious() }
+        }
+        // The metronome follows the song's speed (rate resets to 1 on unload,
+        // so the Metronome tab is back at the plain BPM).
+        .onChange(of: engine.rate, initial: true) { _, rate in
+            metronome.tempoScale = Double(rate)
         }
         .fileImporter(
             isPresented: $showImporter,
@@ -1015,7 +1041,16 @@ struct ContentView: View {
 
     private func backToList() {
         delayTask?.cancel()
+        tempoTask?.cancel()
+        tempoTask = nil   // else a stale task keeps "detecting…" up
+        waveformTask?.cancel()
+        waveformLevels = nil
         engine.unload()
+        if let b = bpmBeforePlayer { metronome.bpm = b }
+        bpmBeforePlayer = nil
+        detectedBPM = nil
+        songBPM = nil
+        tempoVersion = nil
         stems = StemKind.allCases.map { Stem(kind: $0) }
         nowPlayingTitle = nil
         nowPlayingID = nil
@@ -1131,9 +1166,11 @@ struct ContentView: View {
         }
         stems = assigned
         do {
+            if !engine.isLoaded { bpmBeforePlayer = metronome.bpm }
             try engine.load(stems: stems)
             nowPlayingTitle = song.name
             nowPlayingID = song.id
+            restorePractice(stems: song.stems)
             engine.setNowPlaying(title: song.title, artist: song.artist,
                                  artworkURL: song.artworkURL)
             if autoPlay { engine.play() }
@@ -1225,21 +1262,7 @@ struct ContentView: View {
 
     private var transportBar: some View {
         VStack(spacing: 12) {
-            Slider(
-                value: Binding(
-                    get: { engine.currentTime },
-                    set: { engine.seek(to: $0) }
-                ),
-                in: 0...max(engine.duration, 0.01)
-            )
-
-            HStack {
-                Text(timeString(engine.currentTime))
-                Spacer()
-                Text(timeString(engine.duration))
-            }
-            .font(.caption.monospacedDigit())
-            .foregroundStyle(.secondary)
+            SongTimelineView(engine: engine, levels: waveformLevels)
 
             HStack(spacing: 24) {
                 Button {
@@ -1283,9 +1306,294 @@ struct ContentView: View {
                 .buttonStyle(.plain)
             }
 
+            loopBar
+            if let loopHint {
+                Text(loopHint)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(.opacity)
+            }
+            speedBar
             metronomeBar
         }
         .padding()
+    }
+
+    // MARK: - Loop (A–B) and speed
+
+    /// A / B markers (tap = set at the current position, −/+ = nudge by 0.1 s),
+    /// loop on/off and clear.
+    private var loopBar: some View {
+        HStack(spacing: 8) {
+            loopPointControl("A", time: engine.loopStart,
+                             set: { engine.setLoopStart(engine.currentTime) },
+                             nudge: { engine.nudgeLoopStart(by: $0) })
+            loopPointControl("B", time: engine.loopEnd,
+                             set: { setLoopEndOrExplain() },
+                             nudge: { engine.nudgeLoopEnd(by: $0) })
+                .disabled(engine.loopStart == nil)
+
+            Spacer(minLength: 0)
+
+            Button {
+                engine.setLoopEnabled(!engine.isLoopEnabled)
+            } label: {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 18))
+                    .foregroundStyle(engine.isLoopEnabled ? Color.accentColor : .secondary)
+            }
+            .disabled(!engine.hasLoopRegion)
+            .accessibilityLabel(engine.isLoopEnabled ? "Loop on" : "Loop off")
+
+            if engine.loopStart != nil {
+                Button {
+                    engine.clearLoop()
+                } label: {
+                    Image(systemName: "xmark.circle")
+                        .font(.system(size: 18))
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityLabel("Clear loop")
+            }
+        }
+        .buttonStyle(.plain)
+        .sensoryFeedback(.warning, trigger: loopRejectCount)
+    }
+
+    /// "Set B": if refused (before A or closer than the minimum), say why.
+    private func setLoopEndOrExplain() {
+        guard !engine.setLoopEnd(engine.currentTime) else { return }
+        loopRejectCount += 1
+        let a = engine.loopStart ?? 0
+        let minLen = StemMixerEngine.minLoopLength
+        showLoopHint(engine.currentTime < a
+            ? "B must come after A (\(preciseTimeString(a)))."
+            : "B must be at least \(minLen.formatted()) s after A.")
+    }
+
+    private func showLoopHint(_ text: String) {
+        loopHintTask?.cancel()
+        withAnimation { loopHint = text }
+        loopHintTask = Task {
+            try? await Task.sleep(for: .seconds(2.5))
+            guard !Task.isCancelled else { return }
+            withAnimation { loopHint = nil }
+        }
+    }
+
+    private func loopPointControl(_ name: String, time: TimeInterval?,
+                                  set: @escaping () -> Void,
+                                  nudge: @escaping (TimeInterval) -> Void) -> some View {
+        HStack(spacing: 0) {
+            Button {
+                nudge(-0.1)
+            } label: {
+                Image(systemName: "minus").frame(width: 24, height: 30)
+            }
+            .disabled(time == nil)
+            .accessibilityLabel("Move \(name) earlier")
+
+            Button {
+                set()
+            } label: {
+                Text(time.map { "\(name) \(preciseTimeString($0))" } ?? "Set \(name)")
+                    .font(.footnote.monospacedDigit().weight(.semibold))
+                    .frame(minWidth: 62)
+                    .frame(height: 30)
+            }
+            .accessibilityHint("Sets \(name) at the current position")
+
+            Button {
+                nudge(0.1)
+            } label: {
+                Image(systemName: "plus").frame(width: 24, height: 30)
+            }
+            .disabled(time == nil)
+            .accessibilityLabel("Move \(name) later")
+        }
+        .font(.footnote.weight(.semibold))
+        .padding(.horizontal, 2)
+        .background(Capsule().fill(Color.secondary.opacity(0.15)))
+    }
+
+    /// Playback speed, pitch preserved. Tap the percentage to reset to 100%.
+    private var speedBar: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "tortoise")
+                .foregroundStyle(engine.rate < 1 ? Color.accentColor : .secondary)
+            Slider(
+                value: Binding(
+                    get: { Double(engine.rate) },
+                    set: { engine.setRate(Float($0)) }
+                ),
+                in: Double(StemMixerEngine.rateRange.lowerBound)...Double(StemMixerEngine.rateRange.upperBound),
+                step: 0.05
+            ) { editing in
+                if !editing { savePractice() }
+            }
+            Button {
+                engine.setRate(1)
+                savePractice()
+            } label: {
+                Text("\(Int((engine.rate * 100).rounded()))%")
+                    .font(.subheadline.monospacedDigit())
+                    .frame(minWidth: 48, alignment: .trailing)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Speed \(Int((engine.rate * 100).rounded())) percent")
+            .accessibilityHint("Resets to 100 percent")
+        }
+    }
+
+    /// Save the current song's speed and tempo (see PracticeStore). The A–B loop
+    /// is deliberately not saved: it's made fresh every time a song is opened,
+    /// so a loop never carries into playlist playback.
+    private func savePractice() {
+        guard let id = nowPlayingID else { return }
+        PracticeStore.save(PracticeSettings(rate: engine.rate,
+                                            detectedBPM: detectedBPM,
+                                            bpm: songBPM,
+                                            tempoVersion: tempoVersion),
+                           songID: id)
+    }
+
+    /// Restore the song's saved speed (the loop always starts empty — `engine.load`
+    /// clears it). Call after `engine.load` and setting `nowPlayingID`.
+    /// The metronome goes to the song's tempo: the user's choice for this song,
+    /// else the detected one — detected now in the background if not cached yet.
+    private func restorePractice(stems songStems: [StemKind: URL]) {
+        tempoTask?.cancel()
+        tempoTask = nil   // else a stale task keeps "detecting…" up
+        guard let id = nowPlayingID else { return }
+        loadWaveform(songID: id, stems: songStems)
+        let saved = PracticeStore.load(songID: id)
+        engine.setRate(saved.rate ?? 1)
+
+        detectedBPM = saved.detectedBPM
+        songBPM = saved.bpm
+        tempoVersion = saved.tempoVersion
+        if let bpm = saved.bpm ?? saved.detectedBPM.map(Self.metronomeBPM) {
+            metronome.bpm = bpm
+        }
+        // Already analysed by this detector version (found or not) → done.
+        guard saved.tempoVersion != TempoDetector.version else { return }
+        tempoTask = Task {
+            let detection = Task.detached(priority: .utility) {
+                TempoDetector.detect(stems: songStems)
+            }
+            // Cancelling tempoTask (song changed / player closed) doesn't reach a
+            // detached task on its own — forward it so decoding stops early.
+            let found = await withTaskCancellationHandler {
+                await detection.value
+            } onCancel: {
+                detection.cancel()
+            }
+            // Song changed meanwhile → the result belongs to a song no longer shown.
+            guard !Task.isCancelled, nowPlayingID == id else { return }
+            tempoTask = nil   // hides "detecting…" even if nothing was found
+            tempoVersion = TempoDetector.version
+            if let found {
+                detectedBPM = found
+                if songBPM == nil { metronome.bpm = Self.metronomeBPM(found) }
+            }
+            savePractice()
+        }
+    }
+
+    /// Timeline waveform: cached file, or built in the background (~0.5 s) and cached.
+    private func loadWaveform(songID id: String, stems songStems: [StemKind: URL]) {
+        waveformTask?.cancel()
+        waveformLevels = nil
+        waveformTask = Task {
+            let build = Task.detached(priority: .utility) { () -> [UInt8]? in
+                if let cached = Waveform.load(songID: id) { return cached }
+                guard let levels = Waveform.build(stems: songStems) else { return nil }
+                Waveform.save(levels, songID: id)
+                return levels
+            }
+            let levels = await withTaskCancellationHandler {
+                await build.value
+            } onCancel: {
+                build.cancel()
+            }
+            guard !Task.isCancelled, nowPlayingID == id else { return }
+            waveformLevels = levels
+            waveformTask = nil
+        }
+    }
+
+    /// Detected (fractional) tempo → the metronome's integer range.
+    nonisolated private static func metronomeBPM(_ bpm: Double) -> Int {
+        min(240, max(40, Int(bpm.rounded())))
+    }
+
+    /// User set the metronome tempo in the player — remembered for this song.
+    private func setSongBPM(_ bpm: Int) {
+        metronome.bpm = min(240, max(40, bpm))
+        songBPM = metronome.bpm
+        savePractice()
+    }
+
+    /// Back to the detected tempo (forget the user's choice for this song).
+    private func useDetectedBPM() {
+        guard let d = detectedBPM else { return }
+        metronome.bpm = Self.metronomeBPM(d)
+        songBPM = nil
+        savePractice()
+    }
+
+    /// Metronome tempo comes from detection (not changed by the user).
+    private var bpmIsDetected: Bool {
+        songBPM == nil && detectedBPM.map(Self.metronomeBPM) == metronome.bpm
+    }
+
+    /// Tap on the tempo: ×2 / ÷2 (detection's typical miss) and back to detected.
+    private var tempoMenu: some View {
+        Menu {
+            Button("Double (\(metronome.bpm * 2) BPM)", systemImage: "multiply") {
+                setSongBPM(metronome.bpm * 2)
+            }
+            .disabled(metronome.bpm * 2 > 240)
+            Button("Half (\(metronome.bpm / 2) BPM)", systemImage: "divide") {
+                setSongBPM(metronome.bpm / 2)
+            }
+            .disabled(metronome.bpm / 2 < 40)
+            if let d = detectedBPM {
+                Divider()
+                Button("Use detected (\(d.formatted(.number.precision(.fractionLength(1)))) BPM)",
+                       systemImage: "wand.and.stars") {
+                    useDetectedBPM()
+                }
+                .disabled(bpmIsDetected)
+            }
+        } label: {
+            VStack(spacing: 0) {
+                HStack(spacing: 3) {
+                    if bpmIsDetected {
+                        Image(systemName: "wand.and.stars")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("\(metronome.bpm) BPM")
+                        .font(.subheadline.monospacedDigit())
+                }
+                if tempoTask != nil && detectedBPM == nil && songBPM == nil {
+                    Text("detecting…")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else if metronome.tempoScale != 1 {
+                    // Slowed song → the click follows; show the tempo actually played.
+                    Text("→ \(Int(metronome.effectiveBPM.rounded()))")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(minWidth: 78)
+            .contentShape(Rectangle())
+        }
+        .accessibilityLabel("Tempo \(metronome.bpm) BPM\(bpmIsDetected ? ", detected" : "")")
+        .accessibilityHint("Double, halve, or use the detected tempo")
     }
 
     /// Compact metronome bar below the transport buttons — on/off + tempo.
@@ -1309,13 +1617,11 @@ struct ContentView: View {
 
             Spacer()
 
-            Button { metronome.bpm = max(40, metronome.bpm - 1) } label: {
+            Button { setSongBPM(metronome.bpm - 1) } label: {
                 Image(systemName: "minus.circle")
             }
-            Text("\(metronome.bpm) BPM")
-                .font(.subheadline.monospacedDigit())
-                .frame(minWidth: 78)
-            Button { metronome.bpm = min(240, metronome.bpm + 1) } label: {
+            tempoMenu
+            Button { setSongBPM(metronome.bpm + 1) } label: {
                 Image(systemName: "plus.circle")
             }
         }
@@ -1339,6 +1645,7 @@ struct ContentView: View {
             }
         }
         .listStyle(.plain)
+        .scrollIndicators(.hidden)
     }
 
     // MARK: - Import
@@ -1353,10 +1660,12 @@ struct ContentView: View {
                 stems = assigned
                 playQueue = []
                 autoAdvance = false
+                if !engine.isLoaded { bpmBeforePlayer = metronome.bpm }
                 try engine.load(stems: stems)
                 nowPlayingTitle = local.deletingPathExtension().lastPathComponent
                 // Song key = the name of the folder containing the stems (content hash).
                 nowPlayingID = map.values.first?.deletingLastPathComponent().lastPathComponent
+                restorePractice(stems: map)
                 library = StemCache.library()   // the new song is now in the cache
                 if let cached = library.first(where: { $0.id == nowPlayingID }) {
                     engine.setNowPlaying(title: cached.title, artist: cached.artist,
@@ -1390,10 +1699,11 @@ struct ContentView: View {
         }
     }
 
-    private func timeString(_ t: TimeInterval) -> String {
-        guard t.isFinite else { return "0:00" }
-        let total = Int(t)
-        return String(format: "%d:%02d", total / 60, total % 60)
+    /// m:ss.s — for loop boundaries, where tenths matter.
+    private func preciseTimeString(_ t: TimeInterval) -> String {
+        guard t.isFinite else { return "0:00.0" }
+        let tenths = Int((t * 10).rounded())
+        return String(format: "%d:%02d.%d", tenths / 600, (tenths / 10) % 60, tenths % 10)
     }
 }
 

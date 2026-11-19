@@ -116,6 +116,13 @@ final class Metronome {
     var bpm: Int = 120 {
         didSet { if isRunning, bpm != oldValue { reschedule() } }
     }
+    /// Multiplier on `bpm` — the song player's speed, so the click follows a
+    /// slowed-down song (bpm stays the song's original tempo). 1 everywhere else.
+    var tempoScale: Double = 1 {
+        didSet { if isRunning, tempoScale != oldValue { reschedule() } }
+    }
+    /// Tempo actually played: `bpm × tempoScale`.
+    var effectiveBPM: Double { Double(bpm) * tempoScale }
     /// Number of beats per measure (e.g. 4 = 4/4).
     var beatsPerMeasure: Int = 4 {
         didSet { if isRunning, beatsPerMeasure != oldValue { reschedule() } }
@@ -443,7 +450,7 @@ final class Metronome {
     /// step grid instead. Voices ring past their step and wrap around the loop
     /// point, so a tail is not cut off when the measure repeats.
     private func makeMeasureBuffer() -> AVAudioPCMBuffer {
-        let framesPerBeat = max(1, Int(sampleRate * 60.0 / Double(bpm)))
+        let framesPerBeat = max(1, Int(sampleRate * 60.0 / effectiveBPM))
         let beats = activeBeatsPerMeasure
         let total = framesPerBeat * beats
         let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(total))!

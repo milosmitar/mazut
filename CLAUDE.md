@@ -67,7 +67,24 @@ order:   drums, bass, other, vocals, guitar, piano   (== DemucsSeparator.modelOr
 4. `StemMixerEngine` — `AVAudioEngine` graph, one `AVAudioPlayerNode` per stem, synchronized
    transport (play/pause/seek) with per-stem volume/mute/solo. **Singleton** (`.shared`);
    also owns background playback: Now Playing info + remote commands (lock screen), audio
-   session interruptions, and the Live Activity lifecycle.
+   session interruptions, and the Live Activity lifecycle. Graph: players → `stemMixer` →
+   `AVAudioUnitTimePitch` (speed 50–100 %, pitch kept) → mainMixer. A–B loop = segments queued
+   back-to-back on every player (gapless, ≥3 s queued ahead, refilled from the reference
+   player's completion); players start together by host time (`play(at: hostTime)`);
+   `currentFrame()` folds elapsed frames back into the loop. Never build start times from
+   **`outputNode` sample time** — it diverges from the players' timeline once speed ≠ 100 %. Speed
+   persists per song in `<hash>/practice.json` (`PracticeStore`); the A–B loop is
+   deliberately **not** saved (fresh on every open, so it never leaks into playlist playback). The
+   metronome follows the speed via `Metronome.tempoScale` (= `engine.rate`; `bpm` stays the
+   song's original tempo). On opening a song the metronome is set to its tempo:
+   `TempoDetector` (drums-stem onset autocorrelation, vDSP; run once per song in the
+   background, cached as `detectedBPM` in `practice.json`); a tempo the user sets in the
+   player is saved as that song's `bpm` and wins. The Metronome tab's own BPM is restored
+   when leaving the player. The player's scrubber is `SongTimelineView` (time ruler +
+   waveform from `Waveform` cached as `<hash>/waveform-v1.bin`, pinch zoom; the loop is only
+   a tint over the waveform, growing A→playhead between "Set A" and "Set B"); dragging on
+   the ruler creates/resizes/moves the loop — a local draft, committed once via
+   `engine.setLoopRegion` on release.
 5. `ContentView` — single SwiftUI view: library list, file importer, transport, stem mixer.
 6. `Mazut/Learning/` — the "Learning" tab: user-created folders of lesson clips, each a local
    video (picked via `PhotosPicker`, copied into the library's `Media/` folder)
