@@ -132,6 +132,10 @@ struct ContentView: View {
                 tabs
             }
         }
+        // Dark everywhere — the tabs' wallpaper is dark (light-mode near-black text
+        // is unreadable on it) and the player matches the rest of the app. Set on
+        // the outer Group, not on `tabs`, so the player gets it too.
+        .preferredColorScheme(.dark)
         .onAppear {
             library = StemCache.library()
             playlists = PlaylistStore.load()
@@ -188,10 +192,6 @@ struct ContentView: View {
             //     .tabItem { Label("Tuner", systemImage: "tuningfork") }
             //     .tag(4)
         }
-        // The wallpaper behind these tabs is dark, so force dark-mode text/controls
-        // regardless of system appearance — default light-mode (near-black) text is
-        // unreadable against it otherwise.
-        .preferredColorScheme(.dark)
         .onChange(of: selectedTab) { _, newValue in
             // The tuner and the timing coach only record while their tab is open.
             if newValue != 4 { tuner.stop() }
